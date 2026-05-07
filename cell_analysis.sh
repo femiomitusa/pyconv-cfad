@@ -11,7 +11,7 @@ readonly COLOR_YELLOW='\033[1;33m'
 readonly COLOR_BLUE='\033[0;34m'
 readonly COLOR_NC='\033[0m'
 
-readonly NEXRAD_DOWNLOAD_SCRIPT="nexrad_download/data_download.sh"
+readonly NEXRAD_DOWNLOAD_SCRIPT="nexrad_download/data_download.py"
 readonly RADAR_PROCESSING_SCRIPT="radar_processing/process_radar.py"
 readonly REGIONAL_FILTERING_SCRIPT="filter_by_region.py"
 readonly CFAD_RUNNER_SCRIPT="cfad_analysis/run_cfad_with_config.py"
@@ -19,7 +19,7 @@ readonly CFAD_RUNNER_SCRIPT="cfad_analysis/run_cfad_with_config.py"
 PIPELINE_START_TIME=$(date +%s)
 STAGE_START_TIME=0
 STAGE_COUNT=0
-readonly TOTAL_STAGES=6
+TOTAL_STAGES=2  # prerequisite validation + pipeline completion; incremented per enabled stage
 CURRENT_STAGE=""
 
 
@@ -92,11 +92,11 @@ stage_end() {
 
 load_config() {
     print_section "LOADING CONFIGURATION"
-    [ ! -f "config.py" ] && fatal_error "Configuration file 'config.py' not found."
+    if [ ! -f "config.py" ]; then fatal_error "Configuration file 'config.py' not found."; fi
 
     while IFS= read -r -d '' k && IFS= read -r -d '' v; do
         export "$k=$v"
-    done < <(python - <<'PY'
+    done < <(python3 - <<'PY'
 import config, sys
 
 KEYS = [
@@ -120,6 +120,12 @@ PY
 
     print_success "Configuration loaded successfully."
     print_loaded_configuration
+
+    # Count how many pipeline stages are actually enabled
+    if [ "$RUN_NEXRAD_DOWNLOAD"    = "True" ]; then TOTAL_STAGES=$((TOTAL_STAGES + 1)); fi
+    if [ "$RUN_RADAR_PROCESSING"   = "True" ]; then TOTAL_STAGES=$((TOTAL_STAGES + 1)); fi
+    if [ "$RUN_REGIONAL_FILTERING" = "True" ]; then TOTAL_STAGES=$((TOTAL_STAGES + 1)); fi
+    if [ "$RUN_CFAD_ANALYSIS"      = "True" ]; then TOTAL_STAGES=$((TOTAL_STAGES + 1)); fi
 }
 
 print_loaded_configuration() {
@@ -135,7 +141,7 @@ print_loaded_configuration() {
 
 check_python_modules() {
     local modules_csv="$1"
-    MODULES_TO_CHECK="$modules_csv" python - <<'PY'
+    MODULES_TO_CHECK="$modules_csv" python3 - <<'PY'
 import importlib.util
 import sys
 import os
@@ -158,7 +164,7 @@ validate_core_packages() {
 }
 
 validate_radar_packages() {
-    [ "$RUN_RADAR_PROCESSING" != "True" ] && return
+    if [ "$RUN_RADAR_PROCESSING" != "True" ]; then return; fi
 
     local missing
     missing=$(check_python_modules "pyart,netCDF4,scipy")
@@ -170,7 +176,7 @@ validate_radar_packages() {
 }
 
 validate_regional_packages() {
-    [ "$RUN_REGIONAL_FILTERING" != "True" ] && return
+    if [ "$RUN_REGIONAL_FILTERING" != "True" ]; then return; fi
 
     local missing
     missing=$(check_python_modules "shapely,geopandas")
@@ -185,7 +191,7 @@ validate_regional_packages() {
 }
 
 validate_cfad_packages() {
-    [ "$RUN_CFAD_ANALYSIS" != "True" ] && return
+    if [ "$RUN_CFAD_ANALYSIS" != "True" ]; then return; fi
 
     local missing
     missing=$(check_python_modules "numpy,xarray,matplotlib,netCDF4")
@@ -194,6 +200,25 @@ validate_cfad_packages() {
         fatal_error "CFAD analysis packages not found: $missing"
     fi
     print_success "CFAD analysis packages are installed."
+}
+
+validate_download_packages() {
+    if [ "$RUN_NEXRAD_DOWNLOAD" != "True" ]; then return; fi
+
+    local missing
+    missing=$(check_python_modules "boto3,tqdm")
+
+    if [ -n "$missing" ]; then
+        print_error "NEXRAD download packages not found: $missing"
+        echo ""
+        echo "Please install dependencies:"
+        echo "  pip install -r nexrad_download/requirements.txt"
+        echo ""
+        echo "Or manually:"
+        echo "  pip install boto3 tqdm"
+        fatal_error "Missing Python dependencies for NEXRAD download"
+    fi
+    print_success "NEXRAD download packages are installed."
 }
 
 ensure_directory_exists() {
@@ -239,6 +264,7 @@ validate_prerequisites() {
     stage_start "PREREQUISITE VALIDATION"
 
     validate_core_packages
+    validate_download_packages
     validate_radar_packages
     validate_regional_packages
     validate_cfad_packages
@@ -264,21 +290,21 @@ verify_existing_nexrad_files() {
 run_nexrad_download() {
     if [ "$RUN_NEXRAD_DOWNLOAD" != "True" ]; then
         print_section "NEXRAD DOWNLOAD"
-        print_warning "NEXRAD download is disabled in config.py. Assuming data exists."
+        print_warning "Download disabled in config.py. Verifying existing data..."
         verify_existing_nexrad_files
         return
     fi
 
     stage_start "NEXRAD DATA DOWNLOAD"
-    [ ! -f "$NEXRAD_DOWNLOAD_SCRIPT" ] && fatal_error "NEXRAD download script not found at $NEXRAD_DOWNLOAD_SCRIPT"
 
     if [ "$TARGET_MODE" == "True" ]; then
-        echo "Downloading NEXRAD data for target date: $(format_target_date)"
+        echo "Downloading data for target date: $(format_target_date)"
     else
-        echo "Downloading NEXRAD data for years $YEAR_START to $YEAR_END, months: $VALID_MONTHS"
+        echo "Downloading data for years $YEAR_START-$YEAR_END, months: $VALID_MONTHS"
     fi
 
-    bash "$NEXRAD_DOWNLOAD_SCRIPT"
+    python3 "$NEXRAD_DOWNLOAD_SCRIPT"
+
     stage_end "NEXRAD DATA DOWNLOAD" "true"
 }
 
@@ -301,12 +327,12 @@ run_radar_processing() {
 
     stage_start "RADAR DATA PROCESSING"
     echo "Processing radar data..."
-    python "$RADAR_PROCESSING_SCRIPT"
+    python3 "$RADAR_PROCESSING_SCRIPT"
     stage_end "RADAR DATA PROCESSING" "true"
 }
 
 has_regional_filtering_dependencies() {
-    python -c "import shapely, geopandas" 2>/dev/null
+    python3 -c "import shapely, geopandas" 2>/dev/null
 }
 
 run_regional_filtering() {
@@ -326,19 +352,13 @@ run_regional_filtering() {
 
     if [ "$TARGET_MODE" == "True" ]; then
         echo "Running regional filtering for target date: $(format_target_date)"
-        python "$REGIONAL_FILTERING_SCRIPT" --date "$(format_target_date)"
+        python3 "$REGIONAL_FILTERING_SCRIPT" --date "$(format_target_date)"
     else
         echo "Running regional filtering for years $YEAR_START to $YEAR_END..."
-        python "$REGIONAL_FILTERING_SCRIPT"
+        python3 "$REGIONAL_FILTERING_SCRIPT"
     fi
 
     stage_end "REGIONAL FILTERING" "true"
-}
-
-check_conda_availability() {
-    if ! command -v conda &> /dev/null; then
-        print_warning "Conda command not found. Assuming environment is correctly activated."
-    fi
 }
 
 run_cfad_analysis() {
@@ -349,14 +369,13 @@ run_cfad_analysis() {
     fi
 
     stage_start "CFAD ANALYSIS"
-    check_conda_availability
 
     if [ "$TARGET_MODE" == "True" ]; then
         echo "Running CFAD analysis for target date: $(format_target_date)"
-        CFAD_MULTI_TEMPORAL_ENABLED=False PYART_QUIET=1 python "$CFAD_RUNNER_SCRIPT"
+        CFAD_MULTI_TEMPORAL_ENABLED=False PYART_QUIET=1 python3 "$CFAD_RUNNER_SCRIPT"
     else
         echo "Running CFAD analysis with safeguards..."
-        PYART_QUIET=1 python "$CFAD_RUNNER_SCRIPT"
+        PYART_QUIET=1 python3 "$CFAD_RUNNER_SCRIPT"
     fi
 
     stage_end "CFAD ANALYSIS" "true"
@@ -387,20 +406,6 @@ print_output_locations() {
     fi
 }
 
-report_skipped_days() {
-    local skipped_log="$BASE_DATA_DIR/skipped_days.log"
-    if [ -f "$skipped_log" ]; then
-        echo
-        print_section "SKIPPED DAYS REPORT"
-        echo "The following days were skipped during processing:"
-        cat "$skipped_log"
-        local skip_count
-        skip_count=$(wc -l < "$skipped_log")
-        echo
-        echo "Total skipped days: $skip_count"
-    fi
-}
-
 summarize_pipeline() {
     stage_start "PIPELINE COMPLETION"
 
@@ -420,7 +425,6 @@ summarize_pipeline() {
     echo
 
     print_output_locations
-    report_skipped_days
 
     stage_end "PIPELINE COMPLETION" "true"
     print_header "END OF PIPELINE"
