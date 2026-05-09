@@ -49,8 +49,8 @@ VALID_MONTHS = ['Jun', 'Jul', 'Aug']
 
 # Target date for single-day analysis
 TARGET_YEAR = 2022
-TARGET_MONTH = 6
-TARGET_DAY = 27
+TARGET_MONTH = 7
+TARGET_DAY = 10
 
 # ============================================================================
 # RADAR PROCESSING SETTINGS
@@ -96,7 +96,7 @@ TOBAC_MAX_GAP = 2                     # missed scans before track terminates
 
 # Radar visualization
 PLOT_FIGSIZE = (8, 8)
-REFLECTIVITY_LIMITS = (-5, 50)
+REFLECTIVITY_LIMITS = (0, 50)
 COLORMAP = 'NWSRef'
 
 # ============================================================================

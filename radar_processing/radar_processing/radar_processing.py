@@ -1,118 +1,80 @@
 import os
-os.environ['PYART_QUIET'] = "1"  # Suppress welcome message after first time
+os.environ['PYART_QUIET'] = "1"
 
+import sys
 import numpy as np
 import pyart
-import sys
-from typing import Tuple, Dict, List
+from pathlib import Path
 
-# Add myutils directory to Python path
-sys.path.insert(1, os.path.join(os.path.dirname(__file__), 'myutils'))
-import multiprocessing as mp
-from sort import latlon2cart, extract_and_save
-# Add project root to Python path for config import
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
 from config import (
     GRID_SHAPE, GRID_LIMITS, RHOHV_THRESHOLD, KDP_PARAMS,
-    VERTICAL_LIMIT, WEIGHTING_FUNCTION
+    VERTICAL_LIMIT, WEIGHTING_FUNCTION,
 )
 
-def setup_radar_grid(grid_bounds: Tuple[float, float], grid_points: int, grid_spacing: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Create a matching grid for radar data."""
+FIELD_NAMES = ['reflectivity', 'differential_reflectivity', 'cross_correlation_ratio', 'kdp']
+
+
+def setup_radar_grid(grid_bounds, grid_points, grid_spacing):
     xx, yy = np.meshgrid(
         np.linspace(grid_bounds[0], grid_bounds[1], grid_points),
-        np.linspace(grid_bounds[0], grid_bounds[1], grid_points)
+        np.linspace(grid_bounds[0], grid_bounds[1], grid_points),
     )
     z = np.linspace(0, VERTICAL_LIMIT, grid_spacing)
     return xx, yy, z
 
-def process_radar_file(filename: str) -> Dict:
-    """Process radar file and return gridded data."""
+
+def process_radar_file(
+    filename,
+    *,
+    kdp_parallel: bool | None = None,
+    include_kdp: bool = True,
+    field_names: tuple[str, ...] | None = None,
+):
+    """Read one NEXRAD file, compute KDP, grid it, apply RhoHV mask. Returns field dict.
+
+    kdp_parallel overrides KDP_PARAMS['parallel'] when set. Pass False in
+    worker processes to prevent joblib from spawning threads inside each worker.
+    Set include_kdp=False for detection-only passes that do not need KDP or ZDR.
+    """
     radar = pyart.io.read(filename)
-    
-    # Calculate KDP
-    kdp_vulpiani = pyart.retrieve.kdp_vulpiani(
-        radar, 
-        gatefilter=None,
-        **KDP_PARAMS
-    )
-    radar.add_field('kdp', kdp_vulpiani[0])
-    
-    # Grid the radar
-    grid_radar = pyart.map.grid_from_radars(
+
+    if field_names is None:
+        field_names = tuple(FIELD_NAMES if include_kdp else ("reflectivity", "cross_correlation_ratio"))
+
+    if include_kdp and "kdp" in field_names:
+        kdp_params = dict(KDP_PARAMS)
+        if kdp_parallel is not None:
+            kdp_params["parallel"] = kdp_parallel
+        kdp, _ = pyart.retrieve.kdp_vulpiani(radar, gatefilter=None, **kdp_params)
+        radar.add_field('kdp', kdp)
+
+    grid = pyart.map.grid_from_radars(
         radar,
         GRID_SHAPE,
         GRID_LIMITS,
+        fields=list(field_names),
         roi=None,
-        weighting_function=WEIGHTING_FUNCTION
+        weighting_function=WEIGHTING_FUNCTION,
     )
-    
-    # Extract fields
-    fields = {}
-    field_names = ['reflectivity', 'differential_reflectivity', 'cross_correlation_ratio', 'kdp']
-    for field_name in field_names:
-        fields[field_name] = grid_radar.fields[field_name]['data']
-    
-    # Create mask based on rhohv threshold
+    del radar
+
+    fields = {name: grid.fields[name]['data'] for name in field_names}
+    lat_2d = grid.point_latitude['data'][0].astype(np.float32)
+    lon_2d = grid.point_longitude['data'][0].astype(np.float32)
+    del grid
+
+    # keep raw copy for visualization before RhoHV masking
+    fields['reflectivity_raw'] = fields['reflectivity'].copy()
+
     mask = fields['cross_correlation_ratio'] < RHOHV_THRESHOLD
-    
-    # Apply masking to all fields
-    for field_name in field_names:
-        if hasattr(fields[field_name], 'mask'):
-            fields[field_name].mask = fields[field_name].mask | mask
+    for name in field_names:
+        if hasattr(fields[name], 'mask'):
+            fields[name].mask = fields[name].mask | mask
         else:
-            fields[field_name] = np.ma.masked_array(fields[field_name], mask=mask)
-    
+            fields[name] = np.ma.masked_array(fields[name], mask=mask)
+
+    fields['lat_2d'] = lat_2d
+    fields['lon_2d'] = lon_2d
     return fields
-
-def process_cell(args: Tuple) -> Dict:
-    """Process a single cell's data (for parallel processing)."""
-    cell_params, radar_fields, xx, yy = args
-    
-    xctr, yctr = cell_params['gridlon'], cell_params['gridlat']
-    rad_lim = cell_params['radius']
-    
-    rad = np.sqrt((xx - xctr) ** 2 + (yy - yctr) ** 2)
-    storm_loc = rad <= rad_lim
-    num_grid_pts = np.sum(storm_loc)
-    
-    # Initialize storage arrays for each field
-    field_data = {}
-    for field_name, field_values in radar_fields.items():
-        save_array = np.full((num_grid_pts, field_values.shape[0]), np.nan)
-        
-        # Extract data for each vertical level
-        for j in range(field_values.shape[0]):
-            save_array = extract_and_save(
-                np.squeeze(field_values[j, :, :]),
-                save_array,
-                storm_loc,
-                j
-            )
-        field_data[f'{field_name}_save'] = save_array.tolist()
-    
-    return {
-        'basetime': cell_params['base_time'],
-        'radius': rad_lim,
-        'tracks': cell_params['tracks'],
-        'area': cell_params['area'],
-        'gridlon': xctr,
-        'gridlat': yctr,
-        'longitude': cell_params['longitudes'],
-        'latitude': cell_params['latitudes'],
-        **field_data
-    }
-
-def parallel_process_cells(cell_params_list: List[Dict], radar_fields: Dict, xx: np.ndarray, yy: np.ndarray) -> List[Dict]:
-    """Process multiple cells in parallel."""
-    # Prepare arguments for parallel processing
-    args_list = [
-        ({k: v[i] for k, v in cell_params_list.items()}, radar_fields, xx, yy)
-        for i in range(len(cell_params_list['radius']))
-    ]
-    
-    # Use multiprocessing to process cells in parallel
-    with mp.Pool(processes=mp.cpu_count()) as pool:
-        results = pool.map(process_cell, args_list)
-    
-    return results
