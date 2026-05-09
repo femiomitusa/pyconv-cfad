@@ -11,6 +11,7 @@ readonly COLOR_YELLOW='\033[1;33m'
 readonly COLOR_BLUE='\033[0;34m'
 readonly COLOR_NC='\033[0m'
 
+readonly STAGE0_SETUP_SCRIPT="setup_regions.py"
 readonly NEXRAD_DOWNLOAD_SCRIPT="nexrad_download/data_download.py"
 readonly RADAR_PROCESSING_SCRIPT="radar_processing/process_radar.py"
 readonly REGIONAL_FILTERING_SCRIPT="filter_by_region.py"
@@ -101,6 +102,7 @@ import config, sys
 
 KEYS = [
     'BASE_DATA_DIR','YEAR_START','YEAR_END','VALID_MONTHS',
+    'RUN_REGION_SETUP',
     'RUN_NEXRAD_DOWNLOAD','RUN_RADAR_PROCESSING','RUN_CFAD_ANALYSIS',
     'RUN_REGIONAL_FILTERING','TARGET_YEAR','TARGET_MONTH','TARGET_DAY',
     'TARGET_MODE','CFAD_OUTPUT_DIR'
@@ -122,6 +124,7 @@ PY
     print_loaded_configuration
 
     # Count how many pipeline stages are actually enabled
+    if [ "$RUN_REGION_SETUP"       = "True" ]; then TOTAL_STAGES=$((TOTAL_STAGES + 1)); fi
     if [ "$RUN_NEXRAD_DOWNLOAD"    = "True" ]; then TOTAL_STAGES=$((TOTAL_STAGES + 1)); fi
     if [ "$RUN_RADAR_PROCESSING"   = "True" ]; then TOTAL_STAGES=$((TOTAL_STAGES + 1)); fi
     if [ "$RUN_REGIONAL_FILTERING" = "True" ]; then TOTAL_STAGES=$((TOTAL_STAGES + 1)); fi
@@ -132,6 +135,7 @@ print_loaded_configuration() {
     echo "  Base data directory: ${BASE_DATA_DIR}"
     echo "  Processing years: ${YEAR_START} to ${YEAR_END}"
     echo "  Valid months: ${VALID_MONTHS}"
+    echo "  Region setup enabled: ${RUN_REGION_SETUP}"
     echo "  Download enabled: ${RUN_NEXRAD_DOWNLOAD}"
     echo "  Radar processing enabled: ${RUN_RADAR_PROCESSING}"
     echo "  Regional filtering enabled: ${RUN_REGIONAL_FILTERING}"
@@ -243,6 +247,10 @@ validate_directories() {
 }
 
 validate_required_scripts() {
+    if [ "$RUN_REGION_SETUP" = "True" ] && [ ! -f "$STAGE0_SETUP_SCRIPT" ]; then
+        fatal_error "Region setup script not found at $STAGE0_SETUP_SCRIPT"
+    fi
+
     if [ "$RUN_NEXRAD_DOWNLOAD" = "True" ] && [ ! -f "$NEXRAD_DOWNLOAD_SCRIPT" ]; then
         fatal_error "NEXRAD download script not found at $NEXRAD_DOWNLOAD_SCRIPT"
     fi
@@ -285,6 +293,29 @@ verify_existing_nexrad_files() {
          fatal_error "No NEXRAD files found in $BASE_DATA_DIR. Enable download or ensure data exists."
     fi
     print_success "Found ${file_count// /} existing NEXRAD files."
+}
+
+run_region_setup() {
+    local urban_geojson="${BASE_DATA_DIR}/regions/urban.geojson"
+
+    if [ "$RUN_REGION_SETUP" != "True" ]; then
+        print_section "REGION SETUP"
+        if [ ! -f "$urban_geojson" ]; then
+            fatal_error "Region setup is disabled but $urban_geojson not found. Enable RUN_REGION_SETUP or run stage0_setup_regions.py manually."
+        fi
+        print_warning "Region setup disabled. Using existing urban.geojson."
+        return
+    fi
+
+    if [ -f "$urban_geojson" ]; then
+        print_section "REGION SETUP"
+        print_warning "urban.geojson already exists. Skipping. Delete it to rebuild regions."
+        return
+    fi
+
+    stage_start "REGION SETUP"
+    python3 "$STAGE0_SETUP_SCRIPT"
+    stage_end "REGION SETUP" "true"
 }
 
 run_nexrad_download() {
@@ -388,6 +419,7 @@ format_duration() {
 
 print_processing_summary() {
     echo "PROCESSING SUMMARY:"
+    echo "  Region setup enabled: $RUN_REGION_SETUP"
     echo "  Download enabled: $RUN_NEXRAD_DOWNLOAD"
     echo "  Radar processing enabled: $RUN_RADAR_PROCESSING"
     echo "  Regional filtering enabled: $RUN_REGIONAL_FILTERING"
@@ -440,6 +472,7 @@ main() {
 
     load_config
     validate_prerequisites
+    run_region_setup
     run_nexrad_download
     run_radar_processing
     run_regional_filtering

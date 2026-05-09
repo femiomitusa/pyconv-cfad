@@ -30,7 +30,7 @@ try:
     from radar_processing import (
         setup_radar_grid, process_radar_file,
         DetectionConfig, detect_cells, compute_eth_maps,
-        link_tracks, build_track_masks,
+        link_tracks, build_track_masks, compute_track_bearings,
         get_datetime_from_filename, create_radar_plot,
     )
     MODULES_AVAILABLE = True
@@ -198,6 +198,7 @@ def _write_tracking_netcdf(
         "height_max_ref_m", "vil_kg_m2",
         "eccentricity", "orientation_rad",
         "zdr_mean", "rhohv_mean", "kdp_mean",
+        "motion_bearing_deg",
     ]
 
     data_vars: dict = {
@@ -383,6 +384,13 @@ def process_day(year: int, month: int, day: int) -> bool:
         with ProcessPoolExecutor(max_workers=n_workers) as pool:
             for obs_list in pool.map(_pass2_worker, pass2_args):
                 all_obs.extend(obs_list)
+
+    # Inject per-track mean motion bearing derived from consecutive centroid positions.
+    # Singleton tracks (only one scan) receive NaN and are later marked unclassified.
+    if all_obs:
+        cell_bearings = compute_track_bearings(all_obs)
+        for obs in all_obs:
+            obs["motion_bearing_deg"] = cell_bearings.get(int(obs["track_id"]), float("nan"))
 
     # Visualization — main process only (matplotlib is not fork-safe)
     if RADAR_VISUALIZATION:

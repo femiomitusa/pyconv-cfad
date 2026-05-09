@@ -31,6 +31,7 @@ setup(
         "pandas>=1.3.0",
         "xarray>=0.19.0",
         "matplotlib>=3.4.0",
+        "scikit-image>=0.19.0",
         "tqdm>=4.65.0",
     ],
 )

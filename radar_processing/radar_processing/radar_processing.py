@@ -32,12 +32,7 @@ def process_radar_file(
     include_kdp: bool = True,
     field_names: tuple[str, ...] | None = None,
 ):
-    """Read one NEXRAD file, compute KDP, grid it, apply RhoHV mask. Returns field dict.
-
-    kdp_parallel overrides KDP_PARAMS['parallel'] when set. Pass False in
-    worker processes to prevent joblib from spawning threads inside each worker.
-    Set include_kdp=False for detection-only passes that do not need KDP or ZDR.
-    """
+    # kdp_parallel=False prevents joblib spawning threads inside worker processes (CPU oversubscription).
     radar = pyart.io.read(filename)
 
     if field_names is None:

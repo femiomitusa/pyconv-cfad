@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import numpy as np
 import pandas as pd
 import xarray as xr
@@ -16,7 +17,6 @@ def link_tracks(
     memory: int = 2,
 ) -> pd.DataFrame | None:
     """Link TOBAC features across all scans. Returns DataFrame with persistent `cell` IDs, or None."""
-    import logging
     import tobac  # lazy — keeps tobac/iris out of the parent process
     logging.getLogger("trackpy").setLevel(logging.WARNING)
 
@@ -99,5 +99,45 @@ def relabel_mask(mask: np.ndarray, feature_to_cell: dict[int, int]) -> np.ndarra
         if 0 < fid <= max_mask:
             lut[fid] = cid
     return lut[mask]
+
+
+def _geodetic_bearing(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Bearing in degrees clockwise from north, from (lat1,lon1) to (lat2,lon2)."""
+    dlon = np.radians(lon2 - lon1)
+    lat1r, lat2r = np.radians(lat1), np.radians(lat2)
+    x = np.sin(dlon) * np.cos(lat2r)
+    y = np.cos(lat1r) * np.sin(lat2r) - np.sin(lat1r) * np.cos(lat2r) * np.cos(dlon)
+    return float((np.degrees(np.arctan2(x, y)) + 360) % 360)
+
+
+def compute_track_bearings(all_obs: list[dict]) -> dict[int, float]:
+    # Vector mean of step bearings avoids circular-statistics wrap-around (e.g. 359°+1° → 0°, not 180°).
+    by_track: dict[int, list[tuple]] = {}
+    for o in all_obs:
+        by_track.setdefault(int(o["track_id"]), []).append(
+            (int(o["scan_idx"]), float(o["centroid_lat"]), float(o["centroid_lon"]))
+        )
+
+    result: dict[int, float] = {}
+    for track_id, frames in by_track.items():
+        frames.sort()
+        if len(frames) < 2:
+            result[track_id] = float("nan")
+            continue
+
+        step_bearings = []
+        for (_, lat0, lon0), (_, lat1, lon1) in zip(frames, frames[1:]):
+            if lat0 != lat1 or lon0 != lon1:
+                step_bearings.append(_geodetic_bearing(lat0, lon0, lat1, lon1))
+
+        if not step_bearings:
+            result[track_id] = float("nan")
+        else:
+            rads = np.radians(step_bearings)
+            result[track_id] = float(
+                (np.degrees(np.arctan2(np.mean(np.sin(rads)), np.mean(np.cos(rads)))) + 360) % 360
+            )
+
+    return result
 
 

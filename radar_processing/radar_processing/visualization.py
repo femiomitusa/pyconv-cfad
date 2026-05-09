@@ -7,6 +7,8 @@ os.environ["PYART_QUIET"] = "1"
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patheffects as path_effects
+import pandas as pd
+import xarray as xr
 from pathlib import Path
 import pyart  # noqa: F401  # registers Py-ART colormaps such as NWSRef
 from skimage import measure
@@ -30,12 +32,7 @@ _CELL_LABEL_COLOR = "black"
 
 
 def create_radar_plot(xx, yy, Z, track_mask, title, output_path, *, show_ids: bool = False):
-    """Save a reflectivity map with tracked-cell contours overlaid.
-
-    Z         : (ny, nx) float — column-max composite reflectivity.
-    track_mask: (ny, nx) int32 — persistent track IDs (0 = background).
-                Pass None or an all-zero array for scans with no cells.
-    """
+    """Save a reflectivity map with tracked-cell contours overlaid."""
     fig, ax = plt.subplots(figsize=PLOT_FIGSIZE)
 
     if Z.ndim == 3:
@@ -96,9 +93,6 @@ def regenerate_plots_from_tracking(
     show_ids: bool = False,
 ) -> int:
     """Regenerate radar plots from an existing daily tracking.nc file."""
-    import pandas as pd
-    import xarray as xr
-
     date_str = f"{year}{month:02d}{day:02d}"
     tracking_nc = Path(get_array_directory(year, month, day, base_data_dir)) / f"KHGX{date_str}_tracking.nc"
     fig_dir = Path(get_figures_directory(year, month, day, base_data_dir))
