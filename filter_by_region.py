@@ -1,513 +1,571 @@
 #!/usr/bin/env python3
-"""
-NEXRAD Row-Based Regional Filtering using pycellstats approach
 
-Filters individual storm cell rows from .npy files by geographic regions
-using the exact polygon definitions from pycellstats.
-"""
+from __future__ import annotations
 
-import os
-import sys
-import argparse
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 import calendar
-import numpy as np
-from shapely.geometry import Point, Polygon, box
-from shapely.ops import unary_union
-import geopandas as gpd
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import json
+import math
 import multiprocessing as mp
+import sys
+from collections.abc import Iterable
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
 
-# Add project root to path
+import numpy as np
+import xarray as xr
+from shapely.geometry import Point, shape
+
 sys.path.append(str(Path(__file__).parent))
 
-from config import BASE_DATA_DIR, ARRAY_OUTPUT_DIR, REGIONAL_CONFIG, REGIONAL_USE_PARALLEL, REGIONAL_MAX_WORKERS, YEAR_START, YEAR_END, VALID_MONTHS, SKIP_EXISTING_FILTERING
+from config import (
+    ARRAY_OUTPUT_DIR,
+    BASE_DATA_DIR,
+    OUTPUT_DIR,
+    REGIONAL_CONFIG,
+    REGIONAL_MAX_WORKERS,
+    REGIONAL_USE_PARALLEL,
+    SKIP_EXISTING_FILTERING,
+    TARGET_DAY,
+    TARGET_MODE,
+    TARGET_MONTH,
+    TARGET_YEAR,
+    VALID_MONTHS,
+    YEAR_END,
+    YEAR_START,
+)
 
-# pycellstats configuration (from config.py)
+
 CITY_CENTER_LAT = REGIONAL_CONFIG['city_center_lat']
 CITY_CENTER_LON = REGIONAL_CONFIG['city_center_lon']
-DOWNWIND_START = REGIONAL_CONFIG['downwind_start']
-DOWNWIND_END = REGIONAL_CONFIG['downwind_end']
-SECTOR_ANGLE = REGIONAL_CONFIG['sector_angle']
-BOUNDING_BOX_LIMITS = REGIONAL_CONFIG['bounding_box_limits']
-TEMPORAL_WIND = REGIONAL_CONFIG['temporal_wind']
-SHAPEFILE_PATH = REGIONAL_CONFIG['shapefile_path']
+URBAN_GEOJSON = Path(OUTPUT_DIR) / 'regions' / 'urban.geojson'
+HALF_ANGLE = 45.0
 
-def define_urban_region(shapefile_path: str, circle_scale: float = 1.0):
-    """
-    Define urban region from EPSG:4326 shapefile (exact pycellstats implementation).
-    """
-    try:
-        # Read shapefile and verify CRS
-        gdf = gpd.read_file(shapefile_path)
-        if gdf.crs.to_epsg() != 4326:
-            raise ValueError("Shapefile must be in EPSG:4326")
-        
-        # Get center point and UTM projection
-        center_approx = gdf.geometry.union_all().centroid
-        utm_zone = int((center_approx.x + 180) / 6) + 1
-        utm_crs = f"EPSG:{32600 + utm_zone if center_approx.y >= 0 else 32700 + utm_zone}"
-        
-        # Project to UTM, merge polygons, and select largest areas
-        gdf_utm = gdf.to_crs(utm_crs)
-        merged_utm = gdf_utm.geometry.union_all()
-        
-        if hasattr(merged_utm, 'geoms'):
-            # MultiPolygon - select the two largest polygons
-            selected_polygons_utm = merged_utm.__class__(
-                sorted(merged_utm.geoms, key=lambda x: x.area, reverse=True)[:2]
-            )
-        else:
-            selected_polygons_utm = merged_utm
-        
-        # Calculate center and radius in UTM
-        center_utm = selected_polygons_utm.centroid
-        radius_meters = np.sqrt(selected_polygons_utm.area / np.pi) * circle_scale
-        
-        # Convert center back to WGS84
-        center_wgs84 = gpd.GeoDataFrame(geometry=[center_utm], crs=utm_crs).to_crs(epsg=4326).geometry[0]
-        radius_degrees = radius_meters / (111319.5 * np.cos(np.radians(center_wgs84.y)))
-        
-        return {
-            'center': (center_wgs84.y, center_wgs84.x),
-            'radius': radius_degrees
-        }
-    except Exception as e:
-        print(f"Error reading shapefile: {e}")
-        # Use default values
-        return {
-            'center': (CITY_CENTER_LAT, CITY_CENTER_LON),
-            'radius': 0.45  # Default radius in degrees
-        }
-
-def create_extended_wedge(center: Tuple[float, float], inner_radius: float, outer_radius: float, 
-                         angle_start: float, angle_end: float, num_points: int = 100) -> Polygon:
-    """
-    Create a wedge polygon in projected meters.
-
-    The angles are bearings in degrees clockwise from north, matching the wind
-    direction convention used in the configuration. The center coordinate must
-    be supplied as projected ``(x, y)`` coordinates, and radii are in meters.
-    """
-    inner_angles = np.radians(np.linspace(angle_start, angle_end, num_points))
-    outer_angles = np.radians(np.linspace(angle_end, angle_start, num_points))
-    inner_points = [
-        (center[0] + inner_radius * np.sin(a), center[1] + inner_radius * np.cos(a))
-        for a in inner_angles
-    ]
-    outer_points = [
-        (center[0] + outer_radius * np.sin(a), center[1] + outer_radius * np.cos(a))
-        for a in outer_angles
-    ]
-    return Polygon(inner_points + outer_points + [inner_points[0]])
+REGIONS = ('urban', 'downwind', 'right', 'upwind', 'left')
+OUTPUT_GROUPS = ('all', *REGIONS, 'unclassified')
+REGION_TO_CODE = {
+    'unclassified': -1,
+    'urban': 0,
+    'downwind': 1,
+    'right': 2,
+    'upwind': 3,
+    'left': 4,
+}
+CODE_TO_REGION = {v: k for k, v in REGION_TO_CODE.items()}
+UNCLASSIFIED_REASON_TO_CODE = {
+    'classified': 0,
+    'missing_coordinate': 1,
+    'missing_motion_bearing': 2,
+}
 
 
-def _utm_crs_for_lonlat(lon: float, lat: float) -> str:
-    utm_zone = int((lon + 180) / 6) + 1
-    epsg = 32600 + utm_zone if lat >= 0 else 32700 + utm_zone
-    return f"EPSG:{epsg}"
+def load_urban_polygon():
+    """Load the Stage 0 urban boundary from a GeoJSON geometry or Feature."""
+    if not URBAN_GEOJSON.exists():
+        sys.exit(
+            f"Urban polygon not found: {URBAN_GEOJSON}\n"
+            "Run setup_regions.py first."
+        )
 
+    with open(URBAN_GEOJSON) as f:
+        geojson = json.load(f)
 
-def _project_geometry(geometry, source_crs: str, target_crs: str):
-    return gpd.GeoSeries([geometry], crs=source_crs).to_crs(target_crs).iloc[0]
-
-def create_regions(shapefile_path: str = SHAPEFILE_PATH) -> Dict[str, Polygon]:
-    """
-    Create the 5 regions using exact pycellstats approach.
-    """
-    # Get urban region parameters
-    urban_region = define_urban_region(shapefile_path)
-    city_center = urban_region['center']
-    urban_radius = urban_region['radius']
-    
-    # Convert city center to (lon, lat) for geometric operations
-    city_center_lonlat = (city_center[1], city_center[0])
-    utm_crs = _utm_crs_for_lonlat(city_center_lonlat[0], city_center_lonlat[1])
-    center_utm = _project_geometry(Point(city_center_lonlat), "EPSG:4326", utm_crs)
-    center_xy = (center_utm.x, center_utm.y)
-    
-    # Define the bounding box for clipping
-    minx, maxx, miny, maxy = BOUNDING_BOX_LIMITS
-    bounding_box = box(minx, miny, maxx, maxy)
-    bounding_box_utm = _project_geometry(bounding_box, "EPSG:4326", utm_crs)
-    
-    # Create the urban circle as a polygon. The urban radius is returned in
-    # degrees by define_urban_region(), so keep this geometry in WGS84.
-    urban_circle_poly = Point(city_center_lonlat).buffer(urban_radius)
-    
-    # Create the extended wedges using configured kilometer distances.
-    inner_radius_m = DOWNWIND_START * 1000.0
-    outer_radius_m = DOWNWIND_END * 1000.0
-    wind_angle = TEMPORAL_WIND
-    
-    downwind_wedge_utm = create_extended_wedge(center_xy, inner_radius_m, outer_radius_m, 
-                                             wind_angle-(SECTOR_ANGLE/2), wind_angle+(SECTOR_ANGLE/2))
-    upwind_wedge_utm = create_extended_wedge(center_xy, inner_radius_m, outer_radius_m, 
-                                           wind_angle+180-(SECTOR_ANGLE/2), wind_angle+180+(SECTOR_ANGLE/2))
-    right_wedge_utm = create_extended_wedge(center_xy, inner_radius_m, outer_radius_m, 
-                                          wind_angle-180+(SECTOR_ANGLE/2), wind_angle-(SECTOR_ANGLE/2))
-    left_wedge_utm = create_extended_wedge(center_xy, inner_radius_m, outer_radius_m, 
-                                         wind_angle+(SECTOR_ANGLE/2), wind_angle+180-(SECTOR_ANGLE/2))
-    
-    # Clip in projected coordinates, then convert back to WGS84 for point tests.
-    downwind_wedge_poly = _project_geometry(downwind_wedge_utm.intersection(bounding_box_utm), utm_crs, "EPSG:4326")
-    upwind_wedge_poly = _project_geometry(upwind_wedge_utm.intersection(bounding_box_utm), utm_crs, "EPSG:4326")
-    right_wedge_poly = _project_geometry(right_wedge_utm.intersection(bounding_box_utm), utm_crs, "EPSG:4326")
-    left_wedge_poly = _project_geometry(left_wedge_utm.intersection(bounding_box_utm), utm_crs, "EPSG:4326")
-    
-    # Clip the regions to the bounding box
-    regions = {
-        'urban': urban_circle_poly.intersection(bounding_box),
-        'downwind': downwind_wedge_poly.intersection(bounding_box),
-        'upwind': upwind_wedge_poly.intersection(bounding_box),
-        'right': right_wedge_poly.intersection(bounding_box),
-        'left': left_wedge_poly.intersection(bounding_box)
-    }
-    
-    return regions
-
-def classify_row_by_region(row_data: dict, regions: Dict[str, Polygon]) -> Optional[str]:
-    """
-    Classify a single storm cell row by region based on coordinates.
-    """
-    # Extract coordinates from row data
-    lat = None
-    lon = None
-    
-    # Try different coordinate field names
-    if 'latitude' in row_data and 'longitude' in row_data:
-        lat = float(row_data['latitude'])
-        lon = float(row_data['longitude'])
-    elif 'lat' in row_data and 'lon' in row_data:
-        lat = float(row_data['lat'])
-        lon = float(row_data['lon'])
-    
-    if lat is None or lon is None:
-        return None
-    
-    # Create point and check which region it belongs to
-    point = Point(lon, lat)
-    
-    # Check regions in order (urban first, then others)
-    for region_name, region_polygon in regions.items():
-        if region_polygon.contains(point):
-            return region_name
-    
-    return None
-
-def check_regional_output_exists(file_path: Path, output_base: str, regions: Dict[str, Polygon]) -> bool:
-    """
-    Check if regional output files already exist for this input file.
-    
-    Args:
-        file_path: Path to input .npy file
-        output_base: Base output directory
-        regions: Dictionary of region polygons
-        
-    Returns:
-        bool: True if all regional outputs exist, False otherwise
-    """
-    # Skip metadata files
-    if file_path.name.startswith('._') or file_path.name.startswith('.'):
-        return True  # Skip processing metadata files
-    
-    # Extract year/month from file path
-    parts = file_path.parts
-    arrays_idx = None
-    for i, part in enumerate(parts):
-        if 'Arrays' in part:
-            arrays_idx = i
-            break
-    
-    if arrays_idx is None or arrays_idx + 2 >= len(parts):
-        return False
-    
-    year = parts[arrays_idx + 1]
-    month = parts[arrays_idx + 2]
-    
-    # Check if output files exist for each region
-    for region in regions.keys():
-        output_dir = Path(output_base) / 'Arrays' / region / year / month
-        output_file = output_dir / file_path.name
-        if not output_file.exists():
-            return False
-    
-    return True
-
-def process_npy_file(file_path: Path, regions: Dict[str, Polygon], output_base: str, force: bool = False) -> Dict[str, int]:
-    """
-    Process a single .npy file and sort rows by region.
-    """
-    region_counts = {region: 0 for region in regions.keys()}
-    
-    # SAFEGUARD: Check if output already exists (unless forced)
-    if not force and SKIP_EXISTING_FILTERING:
-        if check_regional_output_exists(file_path, output_base, regions):
-            # Count existing files to return accurate counts
-            parts = file_path.parts
-            arrays_idx = None
-            for i, part in enumerate(parts):
-                if 'Arrays' in part:
-                    arrays_idx = i
-                    break
-            
-            if arrays_idx is not None and arrays_idx + 2 < len(parts):
-                year = parts[arrays_idx + 1]
-                month = parts[arrays_idx + 2]
-                
-                # Count rows in existing regional files
-                for region in regions.keys():
-                    output_dir = Path(output_base) / 'Arrays' / region / year / month
-                    output_file = output_dir / file_path.name
-                    if output_file.exists():
-                        try:
-                            existing_data = np.load(output_file, allow_pickle=True)
-                            region_counts[region] = len(existing_data) if existing_data.dtype == 'object' else 0
-                        except:
-                            region_counts[region] = 0
-            
-            return region_counts
-    
-    try:
-        # Load the .npy file
-        data = np.load(file_path, allow_pickle=True)
-        
-        # Skip if not object array or empty
-        if data.dtype != 'object' or len(data) == 0:
-            return region_counts
-        
-        # Initialize regional data containers
-        regional_data = {region: [] for region in regions.keys()}
-        
-        # Process each row (storm cell)
-        for row in data:
-            if not isinstance(row, dict):
-                continue
-                
-            region = classify_row_by_region(row, regions)
-            if region:
-                regional_data[region].append(row)
-                region_counts[region] += 1
-        
-        # Save regional data files
-        parts = file_path.parts
-        arrays_idx = None
-        for i, part in enumerate(parts):
-            if 'Arrays' in part:
-                arrays_idx = i
-                break
-        
-        if arrays_idx is not None and arrays_idx + 2 < len(parts):
-            year = parts[arrays_idx + 1]
-            month = parts[arrays_idx + 2]
-            
-            # Save each region's data
-            for region, rows in regional_data.items():
-                if len(rows) > 0:
-                    # Create output directory
-                    output_dir = Path(output_base) / 'Arrays' / region / year / month
-                    output_dir.mkdir(parents=True, exist_ok=True)
-                    
-                    # Save filtered data
-                    output_file = output_dir / file_path.name
-                    regional_array = np.array(rows, dtype=object)
-                    np.save(output_file, regional_array)
-    
-    except Exception as e:
-        print(f"Error processing {file_path}: {e}")
-    
-    return region_counts
-
-def process_file_wrapper(args):
-    """
-    Wrapper function for parallel processing of .npy files.
-    """
-    file_path, regions, output_base, force = args
-    return process_npy_file(file_path, regions, output_base, force)
-
-def filter_month_directory(month_dir: Path, regions: Dict[str, Polygon], output_base: str, 
-                          use_parallel: bool = True, max_workers: int = None, force: bool = False) -> Dict[str, int]:
-    """
-    Process all .npy files in a month directory with optional parallel processing.
-    
-    Args:
-        month_dir: Path to month directory containing .npy files
-        regions: Dictionary of region polygons
-        output_base: Base output directory
-        use_parallel: Whether to use parallel processing (default: True)
-        max_workers: Maximum number of parallel workers (default: CPU count)
-    """
-    total_counts = {region: 0 for region in regions.keys()}
-    
-    # Process all .npy files (exclude macOS metadata files)
-    npy_files = [f for f in month_dir.glob('*.npy') if not f.name.startswith('._') and not f.name.startswith('.')]
-    
-    if not npy_files:
-        return total_counts
-    
-    
-    if use_parallel and len(npy_files) > 1:
-        # Use parallel processing for multiple files
-        if max_workers is None:
-            max_workers = min(mp.cpu_count(), len(npy_files))
-        
-        # Prepare arguments for parallel processing
-        file_args = [(file_path, regions, output_base, force) for file_path in npy_files]
-        
-        print(f"Using {max_workers} parallel workers...")
-        
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all tasks
-            future_to_file = {executor.submit(process_file_wrapper, args): args[0] 
-                            for args in file_args}
-            
-            # Process completed tasks
-            for future in as_completed(future_to_file):
-                file_path = future_to_file[future]
-                try:
-                    file_counts = future.result()
-                    # Add to totals
-                    for region, count in file_counts.items():
-                        total_counts[region] += count
-                except Exception as e:
-                    print(f"Error processing {file_path}: {e}")
+    geojson_type = geojson.get('type')
+    if geojson_type == 'Feature':
+        geom = geojson['geometry']
+    elif geojson_type in {'Polygon', 'MultiPolygon'}:
+        geom = geojson
     else:
-        # Sequential processing for single file or when parallel is disabled
-        for file_path in npy_files:
-            file_counts = process_npy_file(file_path, regions, output_base, force)
-            
-            # Add to totals
-            for region, count in file_counts.items():
-                total_counts[region] += count
-    
-    return total_counts
+        raise ValueError(
+            f"{URBAN_GEOJSON} must be a GeoJSON Feature, Polygon, or MultiPolygon; "
+            f"found {geojson_type!r}."
+        )
 
-def filter_nexrad_by_region(source_dir: str, target_base: str, 
-                          date_filter: Optional[str] = None, 
-                          use_parallel: bool = True, max_workers: int = None, force: bool = False) -> Dict[str, int]:
-    """
-    Main function to filter NEXRAD data by regions with parallel processing.
-    
-    Args:
-        source_dir: Source directory containing Arrays/YEAR/MONTH structure
-        target_base: Target base directory for regional output
-        date_filter: Optional date filter in YYYY-MM or YYYY-MM-DD format
-        use_parallel: Whether to use parallel processing (default: True)
-        max_workers: Maximum number of parallel workers (default: CPU count)
-    """
-    print()
-    regions = create_regions()
-    
-    source_path = Path(source_dir)
-    total_counts = {region: 0 for region in regions.keys()}
-    
-    if not source_path.exists():
-        print(f"Source directory does not exist: {source_path}")
-        return total_counts
-    
-    # Scan directory structure
-    for year_dir in source_path.iterdir():
+    polygon = shape(geom)
+    if polygon.is_empty:
+        raise ValueError(f"Urban polygon is empty: {URBAN_GEOJSON}")
+    if not polygon.is_valid:
+        raise ValueError(f"Urban polygon is invalid: {URBAN_GEOJSON}")
+    return polygon
+
+
+def _bearing(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Geodetic bearing in degrees clockwise from north, from point 1 to point 2."""
+    dlon = math.radians(lon2 - lon1)
+    lat1r, lat2r = math.radians(lat1), math.radians(lat2)
+    x = math.sin(dlon) * math.cos(lat2r)
+    y = (
+        math.cos(lat1r) * math.sin(lat2r)
+        - math.sin(lat1r) * math.cos(lat2r) * math.cos(dlon)
+    )
+    return (math.degrees(math.atan2(x, y)) + 360) % 360
+
+
+def _is_missing(value: float) -> bool:
+    try:
+        return not np.isfinite(float(value))
+    except (TypeError, ValueError):
+        return True
+
+
+def _wind_from_direction(motion_to_bearing_deg: float) -> float:
+    """Convert a tracked-cell motion-to bearing into meteorological from-direction."""
+    return (float(motion_to_bearing_deg) + 180.0) % 360.0
+
+
+def _downwind_bearing(wind_from_direction_deg: float) -> float:
+    """Return the direction toward which the meteorological wind is blowing."""
+    return (float(wind_from_direction_deg) + 180.0) % 360.0
+
+
+def classify_cell_details(row_data: dict, urban_polygon, half_angle: float = HALF_ANGLE) -> dict:
+    """Return region plus diagnostic bearing metadata for one observation."""
+    lat = row_data.get('centroid_lat')
+    lon = row_data.get('centroid_lon')
+    motion_to = row_data.get('motion_bearing_deg')
+
+    if _is_missing(lat) or _is_missing(lon):
+        return {
+            'region': 'unclassified',
+            'region_code': REGION_TO_CODE['unclassified'],
+            'city_bearing_deg': np.nan,
+            'downwind_delta_deg': np.nan,
+            'wind_from_direction_deg': np.nan,
+            'downwind_bearing_deg': np.nan,
+            'unclassified_reason_code': UNCLASSIFIED_REASON_TO_CODE['missing_coordinate'],
+        }
+
+    lat = float(lat)
+    lon = float(lon)
+    city_bearing = _bearing(CITY_CENTER_LAT, CITY_CENTER_LON, lat, lon)
+    wind_from = np.nan
+    downwind_bearing = np.nan
+    downwind_delta = np.nan
+    if not _is_missing(motion_to):
+        wind_from = _wind_from_direction(motion_to)
+        downwind_bearing = _downwind_bearing(wind_from)
+        downwind_delta = (city_bearing - downwind_bearing) % 360
+
+    if urban_polygon.covers(Point(lon, lat)):
+        return {
+            'region': 'urban',
+            'region_code': REGION_TO_CODE['urban'],
+            'city_bearing_deg': city_bearing,
+            'downwind_delta_deg': downwind_delta,
+            'wind_from_direction_deg': wind_from,
+            'downwind_bearing_deg': downwind_bearing,
+            'unclassified_reason_code': UNCLASSIFIED_REASON_TO_CODE['classified'],
+        }
+
+    if _is_missing(motion_to):
+        return {
+            'region': 'unclassified',
+            'region_code': REGION_TO_CODE['unclassified'],
+            'city_bearing_deg': city_bearing,
+            'downwind_delta_deg': np.nan,
+            'wind_from_direction_deg': np.nan,
+            'downwind_bearing_deg': np.nan,
+            'unclassified_reason_code': UNCLASSIFIED_REASON_TO_CODE['missing_motion_bearing'],
+        }
+
+    if downwind_delta <= half_angle or downwind_delta >= 360 - half_angle:
+        region = 'downwind'
+    elif downwind_delta < 180 - half_angle:
+        region = 'right'
+    elif downwind_delta <= 180 + half_angle:
+        region = 'upwind'
+    else:
+        region = 'left'
+
+    return {
+        'region': region,
+        'region_code': REGION_TO_CODE[region],
+        'city_bearing_deg': city_bearing,
+        'downwind_delta_deg': downwind_delta,
+        'wind_from_direction_deg': wind_from,
+        'downwind_bearing_deg': downwind_bearing,
+        'unclassified_reason_code': UNCLASSIFIED_REASON_TO_CODE['classified'],
+    }
+
+
+def _require_tracking_vars(ds, nc_path: Path) -> None:
+    required = ('centroid_lat', 'centroid_lon')
+    missing = [name for name in required if name not in ds]
+    if missing:
+        raise ValueError(f"{nc_path.name} missing required variable(s): {', '.join(missing)}")
+
+
+def classify_dataset(ds, urban_polygon) -> dict:
+    """Classify all obs in an open xarray Dataset and return vector metadata."""
+    n_obs = ds.sizes.get('obs', 0)
+    regions = np.full(n_obs, 'unclassified', dtype=object)
+    region_codes = np.full(n_obs, REGION_TO_CODE['unclassified'], dtype=np.int16)
+    city_bearings = np.full(n_obs, np.nan, dtype=np.float32)
+    downwind_deltas = np.full(n_obs, np.nan, dtype=np.float32)
+    wind_from_directions = np.full(n_obs, np.nan, dtype=np.float32)
+    downwind_bearings = np.full(n_obs, np.nan, dtype=np.float32)
+    reason_codes = np.full(
+        n_obs,
+        UNCLASSIFIED_REASON_TO_CODE['missing_motion_bearing'],
+        dtype=np.int16,
+    )
+
+    if n_obs == 0:
+        return {
+            'regions': regions,
+            'region_codes': region_codes,
+            'city_bearings': city_bearings,
+            'downwind_deltas': downwind_deltas,
+            'wind_from_directions': wind_from_directions,
+            'downwind_bearings': downwind_bearings,
+            'reason_codes': reason_codes,
+        }
+
+    lats = ds['centroid_lat'].values.astype(float)
+    lons = ds['centroid_lon'].values.astype(float)
+    bearings = (
+        ds['motion_bearing_deg'].values.astype(float)
+        if 'motion_bearing_deg' in ds
+        else np.full(n_obs, np.nan, dtype=float)
+    )
+
+    for i in range(n_obs):
+        details = classify_cell_details(
+            {
+                'centroid_lat': lats[i],
+                'centroid_lon': lons[i],
+                'motion_bearing_deg': bearings[i],
+            },
+            urban_polygon,
+        )
+        regions[i] = details['region']
+        region_codes[i] = details['region_code']
+        city_bearings[i] = details['city_bearing_deg']
+        downwind_deltas[i] = details['downwind_delta_deg']
+        wind_from_directions[i] = details['wind_from_direction_deg']
+        downwind_bearings[i] = details['downwind_bearing_deg']
+        reason_codes[i] = details['unclassified_reason_code']
+
+    return {
+        'regions': regions,
+        'region_codes': region_codes,
+        'city_bearings': city_bearings,
+        'downwind_deltas': downwind_deltas,
+        'wind_from_directions': wind_from_directions,
+        'downwind_bearings': downwind_bearings,
+        'reason_codes': reason_codes,
+    }
+
+
+def annotate_dataset(ds, classification: dict):
+    """Return the source dataset with obs-level Stage 3 metadata attached."""
+    annotated = ds.copy()
+    annotated['region_code'] = ('obs', classification['region_codes'])
+    annotated['city_bearing_deg'] = ('obs', classification['city_bearings'])
+    annotated['wind_from_direction_deg'] = ('obs', classification['wind_from_directions'])
+    annotated['downwind_bearing_deg'] = ('obs', classification['downwind_bearings'])
+    annotated['downwind_delta_deg'] = ('obs', classification['downwind_deltas'])
+    annotated['unclassified_reason_code'] = ('obs', classification['reason_codes'])
+
+    annotated['region_code'].attrs.update({
+        'long_name': 'Stage 3 regional classification code',
+        'flag_values': np.array(sorted(CODE_TO_REGION), dtype=np.int16),
+        'flag_meanings': ' '.join(CODE_TO_REGION[k] for k in sorted(CODE_TO_REGION)),
+    })
+    annotated['city_bearing_deg'].attrs.update({
+        'units': 'degree',
+        'long_name': 'bearing from Houston reference point to cell centroid',
+    })
+    annotated['wind_from_direction_deg'].attrs.update({
+        'units': 'degree',
+        'long_name': 'meteorological wind direction associated with the tracked storm-cell motion',
+        'comment': 'Meteorological from-direction convention: 0 from north, 90 from east, clockwise positive.',
+    })
+    annotated['downwind_bearing_deg'].attrs.update({
+        'units': 'degree',
+        'long_name': 'direction toward which the meteorological wind is blowing',
+        'comment': 'Computed as (wind_from_direction_deg + 180) modulo 360.',
+    })
+    annotated['downwind_delta_deg'].attrs.update({
+        'units': 'degree',
+        'long_name': 'city_bearing_deg minus downwind_bearing_deg modulo 360',
+    })
+    annotated['unclassified_reason_code'].attrs.update({
+        'flag_values': np.array(list(UNCLASSIFIED_REASON_TO_CODE.values()), dtype=np.int16),
+        'flag_meanings': ' '.join(UNCLASSIFIED_REASON_TO_CODE),
+    })
+    annotated.attrs.update({
+        'stage3_region_codes': json.dumps(CODE_TO_REGION, sort_keys=True),
+        'stage3_unclassified_reason_codes': json.dumps(
+            {v: k for k, v in UNCLASSIFIED_REASON_TO_CODE.items()},
+            sort_keys=True,
+        ),
+        'stage3_city_center_lat': CITY_CENTER_LAT,
+        'stage3_city_center_lon': CITY_CENTER_LON,
+        'stage3_sector_half_angle_deg': HALF_ANGLE,
+        'stage3_urban_geojson': str(URBAN_GEOJSON),
+        'stage3_direction_convention': (
+            'classification uses meteorological wind FROM direction derived from tracked storm-cell motion; '
+            'downwind is centered on (wind_from_direction_deg + 180) modulo 360 and upwind is centered on wind_from_direction_deg'
+        ),
+    })
+    return annotated
+
+
+def _output_path(nc_path: Path, output_base: str, group: str) -> Path:
+    year = nc_path.parent.parent.name
+    day_dir = nc_path.parent.name
+    stem = nc_path.stem.replace('_tracking', '')
+    return Path(output_base) / 'Arrays_Regional' / group / year / day_dir / f'{stem}_regional.nc'
+
+
+def _regional_outputs_exist(nc_path: Path, output_base: str) -> bool:
+    """True if every Stage 3 output group already exists for this tracking.nc."""
+    return all(_output_path(nc_path, output_base, group).exists() for group in OUTPUT_GROUPS)
+
+
+def _existing_output_counts(nc_path: Path, output_base: str) -> dict[str, int]:
+    """Read counts from existing Stage 3 files when processing is skipped."""
+    counts: dict[str, int] = {r: 0 for r in REGIONS}
+    counts['unclassified'] = 0
+
+    for group in (*REGIONS, 'unclassified'):
+        out_path = _output_path(nc_path, output_base, group)
+        try:
+            with xr.open_dataset(out_path) as ds:
+                counts[group] = int(ds.attrs.get('region_obs_count', ds.sizes.get('obs', 0)))
+        except Exception:
+            counts[group] = 0
+
+    return counts
+
+
+def _write_dataset(ds, out_path: Path) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    ds.to_netcdf(out_path)
+
+
+def _write_region_view(annotated, region_codes: np.ndarray, nc_path: Path, output_base: str, group: str) -> int:
+    if group == 'unclassified':
+        idx = np.where(region_codes == REGION_TO_CODE['unclassified'])[0]
+    else:
+        idx = np.where(region_codes == REGION_TO_CODE[group])[0]
+
+    if len(idx) == 0:
+        region_ds = xr.Dataset(attrs={
+            'region': group,
+            'region_obs_count': 0,
+            'source_file': nc_path.name,
+            'empty_region_file': 'true',
+        })
+    else:
+        region_ds = annotated.isel(obs=idx)
+        region_ds.attrs.update({
+            'region': group,
+            'region_obs_count': int(len(idx)),
+        })
+    _write_dataset(region_ds, _output_path(nc_path, output_base, group))
+    return int(len(idx))
+
+
+def process_tracking_nc(
+    nc_path: Path,
+    urban_polygon,
+    output_base: str,
+    force: bool = False,
+) -> dict[str, int]:
+    """Classify one Stage 2 tracking.nc file and write annotated + regional outputs."""
+    counts: dict[str, int] = {r: 0 for r in REGIONS}
+    counts['unclassified'] = 0
+
+    if not force and SKIP_EXISTING_FILTERING and _regional_outputs_exist(nc_path, output_base):
+        return _existing_output_counts(nc_path, output_base)
+
+    try:
+        with xr.open_dataset(nc_path) as ds:
+            _require_tracking_vars(ds, nc_path)
+            classification = classify_dataset(ds, urban_polygon)
+            annotated = annotate_dataset(ds.load(), classification)
+    except Exception as exc:
+        print(f"  Cannot process {nc_path.name}: {exc}")
+        return counts
+
+    region_codes = classification['region_codes']
+
+    all_path = _output_path(nc_path, output_base, 'all')
+    annotated.attrs.update({
+        'region': 'all',
+        'region_obs_count': int(annotated.sizes.get('obs', 0)),
+    })
+    _write_dataset(annotated, all_path)
+
+    for region in REGIONS:
+        counts[region] = _write_region_view(annotated, region_codes, nc_path, output_base, region)
+    counts['unclassified'] = _write_region_view(
+        annotated, region_codes, nc_path, output_base, 'unclassified'
+    )
+
+    return counts
+
+
+def _process_nc_wrapper(args: tuple) -> dict[str, int]:
+    nc_path, urban_polygon, output_base, force = args
+    return process_tracking_nc(nc_path, urban_polygon, output_base, force)
+
+
+def filter_day_directory(
+    day_dir: Path,
+    urban_polygon,
+    output_base: str,
+    use_parallel: bool = True,
+    max_workers: int | None = None,
+    force: bool = False,
+) -> dict[str, int]:
+    """Process all *_tracking.nc files in one day directory."""
+    nc_files = sorted(day_dir.glob('*_tracking.nc'))
+    total: dict[str, int] = {r: 0 for r in REGIONS}
+    total['unclassified'] = 0
+    if not nc_files:
+        return total
+
+    if use_parallel and len(nc_files) > 1:
+        n_workers = max_workers or min(mp.cpu_count(), len(nc_files))
+        file_args = [(f, urban_polygon, output_base, force) for f in nc_files]
+        with ProcessPoolExecutor(max_workers=n_workers) as ex:
+            futures = {ex.submit(_process_nc_wrapper, a): a[0] for a in file_args}
+            for fut in as_completed(futures):
+                try:
+                    for r, c in fut.result().items():
+                        total[r] += c
+                except Exception as exc:
+                    print(f"  Error: {futures[fut].name}: {exc}")
+    else:
+        for nc in nc_files:
+            for r, c in process_tracking_nc(nc, urban_polygon, output_base, force).items():
+                total[r] += c
+
+    return total
+
+
+def _parse_date_filter(date_filter: str | None) -> tuple[int | None, int | None, int | None]:
+    if not date_filter:
+        return None, None, None
+
+    parts = date_filter.split('-')
+    if len(parts) > 3:
+        raise ValueError("Date filter must be YYYY, YYYY-MM, or YYYY-MM-DD")
+
+    year = int(parts[0])
+    month = int(parts[1]) if len(parts) >= 2 else None
+    day = int(parts[2]) if len(parts) == 3 else None
+    return year, month, day
+
+
+def _iter_day_dirs(source_path: Path, date_filter: str | None) -> Iterable[Path]:
+    filter_year, filter_month, filter_day = _parse_date_filter(date_filter)
+
+    for year_dir in sorted(source_path.iterdir()):
         if not year_dir.is_dir() or not year_dir.name.isdigit():
             continue
-            
+
         year = int(year_dir.name)
-        
-        # Apply date filter if specified, otherwise use config year range
-        if date_filter:
-            date_parts = date_filter.split('-')
-            if len(date_parts) >= 2:
-                filter_year = int(date_parts[0])
-                filter_month = int(date_parts[1])
-                filter_day = int(date_parts[2]) if len(date_parts) == 3 else None
-                if year != filter_year:
-                    continue
-        else:
-            # If no date filter, only process years in config range
-            if year < YEAR_START or year > YEAR_END:
+        if filter_year is not None:
+            if year != filter_year:
                 continue
-        
-        for month_dir in year_dir.iterdir():
-            if not month_dir.is_dir():
+        elif year < YEAR_START or year > YEAR_END:
+            continue
+
+        for day_dir in sorted(year_dir.iterdir()):
+            if not day_dir.is_dir():
                 continue
-                
-            # Apply month/day filter if specified, otherwise use config valid months
-            if date_filter and len(date_parts) >= 2:
-                if filter_day is not None:
-                    # Match specific day directory (e.g., Jul16)
-                    target_dir_name = f"{calendar.month_abbr[filter_month]}{filter_day:02d}"
-                    if month_dir.name != target_dir_name:
-                        continue
-                else:
-                    # Match any day in the month (e.g., Jul*)
-                    month_name = calendar.month_abbr[filter_month]
-                    if not month_dir.name.startswith(month_name):
-                        continue
-            elif not date_filter:
-                # If no date filter, only process valid month/day directories
-                if not any(month_dir.name.startswith(month) for month in VALID_MONTHS):
+
+            if filter_month is not None:
+                expected_prefix = calendar.month_abbr[filter_month]
+                if not day_dir.name.startswith(expected_prefix):
                     continue
-            
-            print(f"Processing {month_dir}")
-            
-            # Process month data with parallel processing
-            month_counts = filter_month_directory(month_dir, regions, target_base, 
-                                                use_parallel, max_workers, force)
-            
-            # Add to totals
-            for region, count in month_counts.items():
-                total_counts[region] += count
-    
-    return total_counts
+                if filter_day is not None and day_dir.name != f'{expected_prefix}{filter_day:02d}':
+                    continue
+            elif not any(day_dir.name.startswith(m) for m in VALID_MONTHS):
+                continue
 
-def main():
-    """Main entry point."""
-    parser = argparse.ArgumentParser(description="Filter NEXRAD storm cell rows by regions (pycellstats approach)")
-    
-    parser.add_argument('--source', '-s', type=str, 
-                       default=ARRAY_OUTPUT_DIR,
-                       help='Source directory path')
-    parser.add_argument('--target', '-t', type=str,
-                       default=BASE_DATA_DIR,
-                       help='Target base directory path')
-    parser.add_argument('--date', '-d', type=str,
-                       help='Date filter in YYYY-MM or YYYY-MM-DD format')
-    parser.add_argument('--parallel', '-p', action='store_true', default=REGIONAL_USE_PARALLEL,
-                       help=f'Use parallel processing (default: {REGIONAL_USE_PARALLEL})')
-    parser.add_argument('--no-parallel', action='store_false', dest='parallel',
-                       help='Disable parallel processing')
-    parser.add_argument('--workers', '-w', type=int, default=REGIONAL_MAX_WORKERS,
-                       help=f'Number of parallel workers (default: {REGIONAL_MAX_WORKERS or "CPU count"})')
-    parser.add_argument('--force', '-f', action='store_true',
-                       help='Force processing even if regional output already exists')
-    
-    args = parser.parse_args()
-    
-    print(f"Source: {args.source}")
-    print(f"Target: {args.target}")
-    print(f"Date filter: {args.date or 'None'}")
-    print(f"Parallel processing: {args.parallel}")
-    if args.parallel:
-        workers = args.workers or mp.cpu_count()
-        print(f"Max workers: {workers}")
-    print(f"Safeguards enabled: {SKIP_EXISTING_FILTERING}")
-    print(f"Force processing: {args.force}")
-    
-    # Run filtering
-    region_counts = filter_nexrad_by_region(args.source, args.target, args.date, 
-                                          args.parallel, args.workers, args.force)
-    
-    # Print results
-    print("\nResults:")
-    print("-" * 20)
-    total_rows = sum(region_counts.values())
-    
-    for region, count in region_counts.items():
-        percentage = (count / total_rows * 100) if total_rows > 0 else 0
-        print(f"{region:>10}: {count:>6} rows ({percentage:5.1f}%)")
-    
-    print(f"{'Total':>10}: {total_rows:>6} rows")
-    print(f"\nFiltering complete - regional data saved to {args.target}/Arrays/[region]/")
+            yield day_dir
 
-if __name__ == "__main__":
+
+def filter_nexrad_by_region(
+    source_dir: str,
+    target_base: str,
+    date_filter: str | None = None,
+    use_parallel: bool = True,
+    max_workers: int | None = None,
+    force: bool = False,
+) -> dict[str, int]:
+    """Walk Stage 2 tracking outputs and write Stage 3 regional products."""
+    urban_polygon = load_urban_polygon()
+    source_path = Path(source_dir)
+    total: dict[str, int] = {r: 0 for r in REGIONS}
+    total['unclassified'] = 0
+
+    if not source_path.exists():
+        print(f"Source directory does not exist: {source_path}")
+        return total
+
+    for day_dir in _iter_day_dirs(source_path, date_filter):
+        print(f"Processing {day_dir}")
+        for r, c in filter_day_directory(
+            day_dir,
+            urban_polygon,
+            target_base,
+            use_parallel,
+            max_workers,
+            force,
+        ).items():
+            total[r] += c
+
+    return total
+
+
+def _date_filter_from_config() -> str | None:
+    if not TARGET_MODE:
+        return None
+    return f'{TARGET_YEAR}-{TARGET_MONTH:02d}-{TARGET_DAY:02d}'
+
+
+def main() -> None:
+    source = ARRAY_OUTPUT_DIR
+    target = BASE_DATA_DIR
+    date_filter = _date_filter_from_config()
+    use_parallel = REGIONAL_USE_PARALLEL
+    workers = REGIONAL_MAX_WORKERS
+    force = False
+
+    print(f"Source  : {source}")
+    print(f"Target  : {target}")
+    print(f"Date    : {date_filter or 'all'}")
+    print(f"Parallel: {use_parallel}  Workers: {workers or 'auto'}")
+    print(f"Force   : {force}  Skip-existing: {SKIP_EXISTING_FILTERING}")
+    print()
+
+    counts = filter_nexrad_by_region(
+        source,
+        target,
+        date_filter,
+        use_parallel,
+        workers,
+        force,
+    )
+
+    classified_total = sum(counts[r] for r in REGIONS)
+    total = classified_total + counts['unclassified']
+
+    print("\nResults")
+    print('-' * 29)
+    for r in REGIONS:
+        pct = counts[r] / total * 100 if total else 0
+        print(f"  {r:>12}: {counts[r]:>6} obs  ({pct:5.1f}%)")
+    pct = counts['unclassified'] / total * 100 if total else 0
+    print(f"  {'unclassified':>12}: {counts['unclassified']:>6} obs  ({pct:5.1f}%)")
+    print(f"  {'total':>12}: {total:>6} obs")
+    print(f"\nOutput -> {target}/Arrays_Regional/")
+
+
+if __name__ == '__main__':
     main()

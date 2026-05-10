@@ -383,11 +383,10 @@ run_regional_filtering() {
 
     if [ "$TARGET_MODE" == "True" ]; then
         echo "Running regional filtering for target date: $(format_target_date)"
-        python3 "$REGIONAL_FILTERING_SCRIPT" --date "$(format_target_date)"
     else
         echo "Running regional filtering for years $YEAR_START to $YEAR_END..."
-        python3 "$REGIONAL_FILTERING_SCRIPT"
     fi
+    python3 "$REGIONAL_FILTERING_SCRIPT"
 
     stage_end "REGIONAL FILTERING" "true"
 }
