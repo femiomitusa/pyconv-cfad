@@ -33,5 +33,6 @@ setup(
         "matplotlib>=3.4.0",
         "scikit-image>=0.19.0",
         "tqdm>=4.65.0",
+        "zarr>=2.16.0",
     ],
 )

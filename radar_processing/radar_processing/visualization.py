@@ -92,21 +92,21 @@ def regenerate_plots_from_tracking(
     overwrite: bool = True,
     show_ids: bool = False,
 ) -> int:
-    """Regenerate radar plots from an existing daily tracking.nc file."""
+    """Regenerate radar plots from an existing daily tracking Zarr store."""
     date_str = f"{year}{month:02d}{day:02d}"
-    tracking_nc = Path(get_array_directory(year, month, day, base_data_dir)) / f"KHGX{date_str}_tracking.nc"
+    tracking_zarr = Path(get_array_directory(year, month, day, base_data_dir)) / f"KHGX{date_str}_tracking.zarr"
     fig_dir = Path(get_figures_directory(year, month, day, base_data_dir))
 
-    if not tracking_nc.exists():
-        raise FileNotFoundError(f"Tracking file not found: {tracking_nc}")
+    if not tracking_zarr.exists():
+        raise FileNotFoundError(f"Tracking store not found: {tracking_zarr}")
 
     fig_dir.mkdir(parents=True, exist_ok=True)
     x = np.linspace(GRID_BOUNDS[0], GRID_BOUNDS[1], GRID_POINTS)
     xx, yy = np.meshgrid(x, x)
 
-    with xr.open_dataset(tracking_nc) as ds:
+    with xr.open_zarr(tracking_zarr, consolidated=False) as ds:
         if "z_composite" not in ds or "mask" not in ds:
-            raise ValueError(f"{tracking_nc} does not contain z_composite and mask")
+            raise ValueError(f"{tracking_zarr} does not contain z_composite and mask")
         z_composites = ds["z_composite"].values
         masks = ds["mask"].values
         scan_times = pd.DatetimeIndex(ds["scan_time"].values)
@@ -134,7 +134,7 @@ def regenerate_plots_from_tracking(
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Regenerate pyconv-cfad radar plots from an existing tracking.nc file."
+        description="Regenerate pyconv-cfad radar plots from an existing tracking Zarr store."
     )
     parser.add_argument("--year", type=int, default=TARGET_YEAR)
     parser.add_argument("--month", type=int, default=TARGET_MONTH)

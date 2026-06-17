@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Stage 2: NEXRAD gridding, TOBAC cell detection + tracking → tracking.nc."""
+"""Stage 2: NEXRAD gridding, TOBAC cell detection + tracking → tracking.zarr."""
 
 import calendar
 import glob
+import shutil
 import sys
 from concurrent.futures import ProcessPoolExecutor
 from multiprocessing import cpu_count
@@ -23,12 +24,13 @@ from config import (
     GRID_BOUNDS, GRID_POINTS, GRID_SPACING, GRID_SPACING_M, VERTICAL_LIMIT,
     TOBAC_THRESHOLDS, TOBAC_SEGMENTATION_THRESHOLD, TOBAC_MIN_PIXELS,
     TOBAC_MAX_DISTANCE_PIXELS, TOBAC_MAX_GAP, GRID_N_WORKERS, RUN_RADAR_PROCESSING,
+    VERBOSE_BATCH_LOGGING,
 )
 from utils import get_data_directory, get_array_directory, get_figures_directory
 
 try:
     from radar_processing import (
-        setup_radar_grid, process_radar_file,
+        setup_radar_grid, process_radar_file, has_usable_reflectivity,
         DetectionConfig, detect_cells, compute_eth_maps,
         link_tracks, build_track_masks, compute_track_bearings,
         get_datetime_from_filename, create_radar_plot,
@@ -48,26 +50,70 @@ def _n_workers() -> int:
 # Module-level worker functions (must be at module level for ProcessPoolExecutor pickling)
 
 
+def _fields_to_dataset(radar_fields: dict, z_levels: np.ndarray) -> xr.Dataset:
+    """Convert one scan's gridded fields to a compact xarray Dataset for Zarr storage."""
+    data_vars = {
+        fname: xr.Variable(
+            ["level", "y", "x"],
+            np.ma.filled(radar_fields[fname].astype(np.float32), np.nan),
+        )
+        for fname in _SAVE_FIELDS
+    }
+    data_vars["lat"] = xr.Variable(["y", "x"], radar_fields["lat_2d"].astype(np.float32))
+    data_vars["lon"] = xr.Variable(["y", "x"], radar_fields["lon_2d"].astype(np.float32))
+    data_vars["z_levels"] = xr.Variable("level", z_levels.astype(np.float32))
+    return xr.Dataset(data_vars)
+
+
+def _save_scan_grid_zarr(path: Path, radar_fields: dict, z_levels: np.ndarray) -> None:
+    """Write one scan's full gridded fields to its own Zarr store."""
+    if path.exists():
+        shutil.rmtree(path)
+    ds = _fields_to_dataset(radar_fields, z_levels)
+    encoding = {
+        fname: {"chunks": (len(z_levels), 128, 128)}
+        for fname in _SAVE_FIELDS
+    }
+    encoding["lat"] = {"chunks": (128, 128)}
+    encoding["lon"] = {"chunks": (128, 128)}
+    ds.to_zarr(path, mode="w", encoding=encoding, consolidated=False)
+
+
+def _load_scan_grid_zarr(path: str | Path) -> dict:
+    """Load one scan's gridded fields from a Zarr store into the existing dict shape."""
+    with xr.open_zarr(path, consolidated=False) as ds:
+        radar_fields = {fname: np.ma.masked_invalid(ds[fname].values) for fname in _SAVE_FIELDS}
+        radar_fields["lat_2d"] = ds["lat"].values.astype(np.float32)
+        radar_fields["lon_2d"] = ds["lon"].values.astype(np.float32)
+    return radar_fields
+
+
 def _pass1_worker(args: tuple) -> tuple:
-    """Grid one radar file and detect cells. Returns 8-tuple ending with error_str (None on success)."""
-    filename, scan_time, detection_cfg = args
+    """Grid one radar file once, persist full fields to Zarr, and detect cells."""
+    filename, scan_time, detection_cfg, temp_grid_path, z_levels = args
     try:
+        # Pre-check: skip files with no usable reflectivity (avoid wasting resources on gridding)
+        if not has_usable_reflectivity(filename, threshold_dbz=detection_cfg.segmentation_threshold):
+            raise ValueError("No reflectivity above threshold")
+
         # kdp_parallel=False: prevents joblib from spawning threads inside each
         # worker process, which would oversubscribe CPUs when N workers are active.
-        radar_fields = process_radar_file(filename, kdp_parallel=False, include_kdp=False)
+        radar_fields = process_radar_file(filename, kdp_parallel=False, include_kdp=True)
+        _save_scan_grid_zarr(Path(temp_grid_path), radar_fields, z_levels)
         z_composite, local_mask, features = detect_cells(
             radar_fields, scan_time, detection_cfg
         )
-        return filename, scan_time, z_composite, local_mask, features, radar_fields['lat_2d'], radar_fields['lon_2d'], None
+        return filename, scan_time, str(temp_grid_path), z_composite, local_mask, features, radar_fields['lat_2d'], radar_fields['lon_2d'], None
     except Exception as exc:
-        return filename, scan_time, None, None, None, None, None, str(exc)
+        return filename, scan_time, str(temp_grid_path), None, None, None, None, None, str(exc)
+
 
 
 def _pass2_worker(args: tuple) -> list[dict]:
-    """Extract cell statistics for one scan. Reruns process_radar_file — full 3-D fields are too large to cache across Pass 1."""
-    filename, scan_time, track_mask, z_composite, z_levels, pixel_area_km2, scan_idx = args
+    """Extract cell statistics for one scan from the one-pass gridded Zarr store."""
+    filename, scan_time, temp_grid_path, track_mask, z_composite, z_levels, pixel_area_km2, scan_idx = args
     try:
-        radar_fields = process_radar_file(filename, kdp_parallel=False)
+        radar_fields = _load_scan_grid_zarr(temp_grid_path)
     except Exception as exc:
         print(f"  Failed (pass 2): {Path(filename).name} — {exc}")
         return []
@@ -161,16 +207,97 @@ def _collect_frame_obs(
             "zdr_mean":            float(np.nanmean(zdr_flat))           if zdr_flat.size else np.nan,
             "rhohv_mean":          float(np.nanmean(rho_flat))           if rho_flat.size else np.nan,
             "kdp_mean":            float(np.nanmean(kdp_flat))           if kdp_flat.size else np.nan,
+            "profile_y":           ys.astype(np.int16),
+            "profile_x":           xs.astype(np.int16),
             **{f"{fname}_profile": profiles[fname] for fname in _SAVE_FIELDS},
         })
     return obs_list
 
 
-# NetCDF output
+# Zarr output
 
 
-def _write_tracking_netcdf(
-    nc_path: Path,
+def _add_track_motion_variables(
+    data_vars: dict,
+    scan_times_np: np.ndarray,
+    all_obs: list[dict],
+    n_obs: int,
+) -> None:
+    """Add cross-scan lifetime/age/motion variables to the output dataset."""
+    sec = scan_times_np.astype("datetime64[s]").astype(np.float64)  # epoch seconds per scan index
+    by_track: dict = {}
+    for i, o in enumerate(all_obs):
+        by_track.setdefault(o["track_id"], []).append(
+            (o["scan_idx"], o["centroid_y"], o["centroid_x"], i)
+        )
+
+    lifetime_arr = np.full(n_obs, np.nan, np.float32)
+    age_arr      = np.full(n_obs, np.nan, np.float32)
+    motion_u_arr = np.full(n_obs, np.nan, np.float32)
+    motion_v_arr = np.full(n_obs, np.nan, np.float32)
+    for scans in by_track.values():
+        scans.sort()
+        t0 = sec[scans[0][0]]
+        lifetime_s = float(sec[scans[-1][0]] - t0)
+        for j, (sidx, cy, cx, i_obs) in enumerate(scans):
+            lifetime_arr[i_obs] = lifetime_s
+            age_arr[i_obs]      = float(sec[sidx] - t0)
+            if len(scans) < 2:
+                continue
+            j0, j1 = max(0, j - 1), min(len(scans) - 1, j + 1)
+            p0, p1 = scans[j0], scans[j1]
+            dt = float(sec[p1[0]] - sec[p0[0]])
+            if dt > 0:
+                motion_u_arr[i_obs] = float((p1[2] - p0[2]) * GRID_SPACING_M / dt)
+                motion_v_arr[i_obs] = float((p1[1] - p0[1]) * GRID_SPACING_M / dt)
+
+    data_vars["lifetime_s"]   = xr.Variable("obs", lifetime_arr)
+    data_vars["age_s"]        = xr.Variable("obs", age_arr)
+    data_vars["motion_u_ms"]  = xr.Variable("obs", motion_u_arr)
+    data_vars["motion_v_ms"]  = xr.Variable("obs", motion_v_arr)
+
+
+def _ragged_profile_vars(all_obs: list[dict], n_levels: int) -> dict:
+    """Build ragged profile variables with one sample per actual cell pixel."""
+    n_samples = int(sum(int(o["n_points"]) for o in all_obs))
+    data_vars: dict = {
+        "sample_obs": xr.Variable("sample", np.empty(n_samples, dtype=np.int32)),
+        "sample_y":   xr.Variable("sample", np.empty(n_samples, dtype=np.int16)),
+        "sample_x":   xr.Variable("sample", np.empty(n_samples, dtype=np.int16)),
+    }
+    for fname in _SAVE_FIELDS:
+        data_vars[fname] = xr.Variable(
+            ["sample", "level"],
+            np.empty((n_samples, n_levels), dtype=np.float32),
+        )
+
+    sample_obs = data_vars["sample_obs"].data
+    sample_y   = data_vars["sample_y"].data
+    sample_x   = data_vars["sample_x"].data
+    profile_data = {fname: data_vars[fname].data for fname in _SAVE_FIELDS}
+
+    cursor = 0
+    for obs_idx, obs in enumerate(all_obs):
+        n_pts = int(obs["n_points"])
+        end = cursor + n_pts
+        sample_obs[cursor:end] = obs_idx
+
+        # Keep the actual grid-point locations for downstream regional/CFAD extraction.
+        ys = np.asarray(obs["profile_y"], dtype=np.int16)
+        xs = np.asarray(obs["profile_x"], dtype=np.int16)
+        sample_y[cursor:end] = ys
+        sample_x[cursor:end] = xs
+
+        for fname in _SAVE_FIELDS:
+            # Stored in observations as (level, point); write Zarr-friendly (sample, level).
+            profile_data[fname][cursor:end, :] = np.asarray(obs[f"{fname}_profile"], dtype=np.float32).T
+        cursor = end
+
+    return data_vars
+
+
+def _write_tracking_zarr(
+    zarr_path: Path,
     valid_scans: list[tuple[str, pd.Timestamp]],
     track_masks: list[np.ndarray],
     z_composites: list[np.ndarray],
@@ -179,14 +306,16 @@ def _write_tracking_netcdf(
     lon_grid: np.ndarray,
     z_levels: np.ndarray,
 ) -> None:
-    """Write one day's tracking results to a compressed NetCDF file."""
+    """Write one day's tracking results to a Zarr store using ragged profile arrays."""
+    if zarr_path.exists():
+        shutil.rmtree(zarr_path)
+
     scan_times_np = np.array([t.to_datetime64() for _, t in valid_scans])
     masks_arr = np.stack(track_masks).astype(np.int32)
     zcomp_arr = np.stack(z_composites).astype(np.float32)
 
     n_obs = len(all_obs)
     n_levels = len(z_levels)
-    max_pts = int(max(o["n_points"] for o in all_obs)) if all_obs else 1
 
     scalar_vars = [
         "scan_idx", "track_id",
@@ -207,8 +336,8 @@ def _write_tracking_netcdf(
                                     attrs={"long_name": "persistent track IDs (0 = background)"}),
         "z_composite": xr.Variable(["scan", "y", "x"], zcomp_arr,
                                     attrs={"units": "dBZ", "long_name": "column-max reflectivity"}),
-        "lat":         xr.Variable(["y", "x"], lat_grid),
-        "lon":         xr.Variable(["y", "x"], lon_grid),
+        "lat":         xr.Variable(["y", "x"], lat_grid.astype(np.float32)),
+        "lon":         xr.Variable(["y", "x"], lon_grid.astype(np.float32)),
         "z_levels":    xr.Variable("level", z_levels.astype(np.float32),
                                     attrs={"units": "m", "long_name": "altitude AGL"}),
     }
@@ -218,59 +347,38 @@ def _write_tracking_netcdf(
             dtype = np.int32 if vname in ("scan_idx", "track_id", "n_points") else np.float32
             data_vars[vname] = xr.Variable("obs", np.array([o[vname] for o in all_obs], dtype=dtype))
 
-        for fname in _SAVE_FIELDS:
-            arr = np.full((n_obs, n_levels, max_pts), np.nan, dtype=np.float32)
-            for i, obs in enumerate(all_obs):
-                prof = obs[f"{fname}_profile"]
-                n_pts = prof.shape[1]
-                arr[i, :, :n_pts] = prof
-            data_vars[fname] = xr.Variable(["obs", "level", "point"], arr)
-
-        # Cross-scan stats: lifetime, age since initiation, storm motion u/v
-        sec = scan_times_np.astype("datetime64[s]").astype(np.float64)  # epoch seconds per scan index
-        by_track: dict = {}
-        for i, o in enumerate(all_obs):
-            by_track.setdefault(o["track_id"], []).append(
-                (o["scan_idx"], o["centroid_y"], o["centroid_x"], i)
-            )
-        lifetime_arr = np.full(n_obs, np.nan, np.float32)
-        age_arr      = np.full(n_obs, np.nan, np.float32)
-        motion_u_arr = np.full(n_obs, np.nan, np.float32)
-        motion_v_arr = np.full(n_obs, np.nan, np.float32)
-        for scans in by_track.values():
-            scans.sort()
-            t0 = sec[scans[0][0]]
-            lifetime_s = float(sec[scans[-1][0]] - t0)
-            for j, (sidx, cy, cx, i_obs) in enumerate(scans):
-                lifetime_arr[i_obs] = lifetime_s
-                age_arr[i_obs]      = float(sec[sidx] - t0)
-                if len(scans) < 2:
-                    continue
-                j0, j1 = max(0, j - 1), min(len(scans) - 1, j + 1)
-                p0, p1 = scans[j0], scans[j1]
-                dt = float(sec[p1[0]] - sec[p0[0]])
-                if dt > 0:
-                    motion_u_arr[i_obs] = float((p1[2] - p0[2]) * GRID_SPACING_M / dt)
-                    motion_v_arr[i_obs] = float((p1[1] - p0[1]) * GRID_SPACING_M / dt)
-        data_vars["lifetime_s"]   = xr.Variable("obs", lifetime_arr)
-        data_vars["age_s"]        = xr.Variable("obs", age_arr)
-        data_vars["motion_u_ms"]  = xr.Variable("obs", motion_u_arr)
-        data_vars["motion_v_ms"]  = xr.Variable("obs", motion_v_arr)
+        data_vars.update(_ragged_profile_vars(all_obs, n_levels))
+        _add_track_motion_variables(data_vars, scan_times_np, all_obs, n_obs)
 
     ds = xr.Dataset(data_vars)
-    enc = {fname: {"zlib": True, "complevel": 9} for fname in _SAVE_FIELDS if fname in ds}
-    enc["mask"]        = {"zlib": True, "complevel": 9, "dtype": "int32"}
-    enc["z_composite"] = {"zlib": True, "complevel": 4}
-    ds.to_netcdf(nc_path, encoding=enc)
+    ds.attrs.update({
+        "format": "PyMOOSAIC tracking Zarr",
+        "profile_storage": "ragged sample arrays: sample_obs/sample_y/sample_x map samples to obs/grid points",
+    })
+
+    encoding = {
+        "mask": {"chunks": (1, GRID_POINTS, GRID_POINTS)},
+        "z_composite": {"chunks": (1, GRID_POINTS, GRID_POINTS)},
+        "lat": {"chunks": (GRID_POINTS, GRID_POINTS)},
+        "lon": {"chunks": (GRID_POINTS, GRID_POINTS)},
+    }
+    if n_obs > 0:
+        sample_chunk = min(max(int(ds.sizes.get("sample", 1)), 1), 50_000)
+        for fname in _SAVE_FIELDS:
+            encoding[fname] = {"chunks": (sample_chunk, n_levels)}
+        for vname in ("sample_obs", "sample_y", "sample_x"):
+            encoding[vname] = {"chunks": (sample_chunk,)}
+
+    ds.to_zarr(zarr_path, mode="w", encoding=encoding, consolidated=False)
 
 
-def _regen_figures(nc_path: Path, fig_dir: str, date_str: str, xx: np.ndarray, yy: np.ndarray) -> None:
-    """Regenerate any missing scan figures from an existing tracking.nc."""
+def _regen_figures(zarr_path: Path, fig_dir: str, date_str: str, xx: np.ndarray, yy: np.ndarray) -> None:
+    """Regenerate any missing scan figures from an existing tracking Zarr store."""
     Path(fig_dir).mkdir(parents=True, exist_ok=True)
-    with xr.open_dataset(nc_path) as ds:
+    with xr.open_zarr(zarr_path, consolidated=False) as ds:
         if "z_composite" not in ds:
-            print(f"  [viz] z_composite missing from {nc_path.name} (old format).")
-            print("  [viz] Delete the .nc file and rerun to regenerate figures.")
+            print(f"  [viz] z_composite missing from {zarr_path.name}.")
+            print("  [viz] Delete the .zarr store and rerun to regenerate figures.")
             return
         z_comps    = ds["z_composite"].values          # (scan, y, x)
         masks      = ds["mask"].values                 # (scan, y, x) int32
@@ -284,7 +392,7 @@ def _regen_figures(nc_path: Path, fig_dir: str, date_str: str, xx: np.ndarray, y
     if not missing:
         return
 
-    print(f"  [viz] Regenerating {len(missing)} missing figure(s) from tracking.nc …")
+    print(f"  [viz] Regenerating {len(missing)} missing figure(s) from tracking Zarr …")
     for i, fig_name in missing:
         fig_path = Path(fig_dir) / fig_name
         try:
@@ -296,25 +404,44 @@ def _regen_figures(nc_path: Path, fig_dir: str, date_str: str, xx: np.ndarray, y
 # Day processing
 
 
-def process_day(year: int, month: int, day: int) -> bool:
-    """Two-pass parallel pipeline for one day. Returns True if output was written."""
+def _was_day_skipped(year: int, month: int, day: int) -> bool:
+    """Check if day output already exists."""
+    if not SKIP_EXISTING_PROCESSING:
+        return False
     date_str = f"{year}{month:02d}{day:02d}"
-    data_dir = get_data_directory(year, month, day, BASE_DATA_DIR)
+    return (Path(get_array_directory(year, month, day, BASE_DATA_DIR)) / f"KHGX{date_str}_tracking.zarr").exists()
+
+
+def process_day(year: int, month: int, day: int) -> bool:
+    """One-pass gridding pipeline for one day. Returns True if output was written."""
+    date_str = f"{year}{month:02d}{day:02d}"
     array_dir = get_array_directory(year, month, day, BASE_DATA_DIR)
     fig_dir = get_figures_directory(year, month, day, BASE_DATA_DIR)
 
-    radar_files = sorted(glob.glob(f"{data_dir}/KHGX{date_str}_*_V06"))
-    if not radar_files:
+    # --- scan enumeration: NEXRAD Level-2 ---
+    data_dir = get_data_directory(year, month, day, BASE_DATA_DIR)
+    nexrad_files = sorted(glob.glob(f"{data_dir}/KHGX{date_str}_*_V06"))
+    scan_items = [
+        (fn, t)
+        for fn in nexrad_files
+        if (t := get_datetime_from_filename(Path(fn).name)) is not None
+    ]
+
+    if not scan_items:
         return False
 
-    tracking_nc = Path(array_dir) / f"KHGX{date_str}_tracking.nc"
-    if SKIP_EXISTING_PROCESSING and tracking_nc.exists():
+    tracking_zarr = Path(array_dir) / f"KHGX{date_str}_tracking.zarr"
+    if SKIP_EXISTING_PROCESSING and tracking_zarr.exists():
         if RADAR_VISUALIZATION:
             xx, yy, _ = setup_radar_grid(GRID_BOUNDS, GRID_POINTS, GRID_SPACING)
-            _regen_figures(tracking_nc, fig_dir, date_str, xx, yy)
+            _regen_figures(tracking_zarr, fig_dir, date_str, xx, yy)
         return True
 
     Path(array_dir).mkdir(parents=True, exist_ok=True)
+    temp_grid_dir = Path(array_dir) / f".KHGX{date_str}_tmp_grids"
+    if temp_grid_dir.exists():
+        shutil.rmtree(temp_grid_dir)
+    temp_grid_dir.mkdir(parents=True, exist_ok=True)
 
     xx, yy, z_levels = setup_radar_grid(GRID_BOUNDS, GRID_POINTS, GRID_SPACING)
     pixel_area_km2 = (GRID_SPACING_M / 1000.0) ** 2
@@ -328,38 +455,42 @@ def process_day(year: int, month: int, day: int) -> bool:
 
     n_workers = _n_workers()
 
-    # Pass 1 — grid + detect
+    # Build pass-1 args for NEXRAD Level-2 files.
     pass1_args = [
-        (fn, t, detection_cfg)
-        for fn in radar_files
-        if (t := get_datetime_from_filename(Path(fn).name)) is not None
+        (fn, t, detection_cfg, temp_grid_dir / f"{Path(fn).name}.zarr", z_levels)
+        for fn, t in scan_items
     ]
+    pass1_fn = _pass1_worker
 
     if not pass1_args:
+        shutil.rmtree(temp_grid_dir, ignore_errors=True)
         return False
 
     with ProcessPoolExecutor(max_workers=n_workers) as pool:
-        pass1_results = list(pool.map(_pass1_worker, pass1_args))
+        pass1_results = list(pool.map(pass1_fn, pass1_args))
 
     valid_scans: list[tuple[str, pd.Timestamp]] = []
+    temp_grid_paths: list[str] = []
     local_masks:  list[np.ndarray] = []
     z_composites: list[np.ndarray] = []
     all_features: list[pd.DataFrame] = []
     lat_grid = lon_grid = None
 
-    for filename, scan_time, z_composite, local_mask, features, lat, lon, error in pass1_results:
+    for filename, scan_time, temp_grid_path, z_composite, local_mask, features, lat, lon, error in pass1_results:
         if error:
             print(f"  Failed (pass 1): {Path(filename).name} — {error}")
             continue
         if lat_grid is None:
             lat_grid, lon_grid = lat, lon
         valid_scans.append((filename, scan_time))
+        temp_grid_paths.append(temp_grid_path)
         z_composites.append(z_composite)
         local_masks.append(local_mask)
         if features is not None:
             all_features.append(features)
 
     if not valid_scans or lat_grid is None:
+        shutil.rmtree(temp_grid_dir, ignore_errors=True)
         return False
 
     # Link tracks — sequential, needs all frames at once
@@ -372,9 +503,9 @@ def process_day(year: int, month: int, day: int) -> bool:
     )
     track_masks = build_track_masks(tracks, local_masks, scan_times)
 
-    # Pass 2 — extract stats + profiles
+    # Extract stats + profiles from the one-pass gridded Zarr stores.
     pass2_args = [
-        (filename, scan_time, track_masks[i], z_composites[i], z_levels, pixel_area_km2, i)
+        (filename, scan_time, temp_grid_paths[i], track_masks[i], z_composites[i], z_levels, pixel_area_km2, i)
         for i, (filename, scan_time) in enumerate(valid_scans)
         if np.any(track_masks[i] > 0)
     ]
@@ -404,9 +535,11 @@ def process_day(year: int, month: int, day: int) -> bool:
             except Exception as exc:
                 print(f"  [viz] Failed: {basename} — {exc}")
 
-    _write_tracking_netcdf(
-        tracking_nc, valid_scans, track_masks, z_composites, all_obs, lat_grid, lon_grid, z_levels
+    _write_tracking_zarr(
+        tracking_zarr, valid_scans, track_masks, z_composites, all_obs, lat_grid, lon_grid, z_levels
     )
+
+    shutil.rmtree(temp_grid_dir, ignore_errors=True)
     return True
 
 
@@ -429,7 +562,7 @@ def main() -> None:
 
     month_map = {calendar.month_abbr[i]: i for i in range(1, 13)}
     valid = set(VALID_MONTHS)
-    success = failed = 0
+    skipped = processed = failed = 0
 
     for year in range(YEAR_START, YEAR_END + 1):
         year_dir = Path(BASE_DATA_DIR) / str(year)
@@ -441,15 +574,22 @@ def main() -> None:
             if d.is_dir() and not d.name.startswith(".") and d.name[:3] in valid
         )
 
-        for day_dir in tqdm(day_dirs, desc=str(year), unit="day", ncols=80):
-            month_num = month_map[day_dir.name[:3]]
-            day_num = int(day_dir.name[3:])
-            if process_day(year, month_num, day_num):
-                success += 1
-            else:
-                failed += 1
+        with tqdm(day_dirs, desc=str(year), unit="day", ncols=100) as pbar:
+            for day_dir in pbar:
+                month_num = month_map[day_dir.name[:3]]
+                day_num = int(day_dir.name[3:])
+                if _was_day_skipped(year, month_num, day_num):
+                    skipped += 1
+                elif process_day(year, month_num, day_num):
+                    processed += 1
+                else:
+                    failed += 1
+                if VERBOSE_BATCH_LOGGING:
+                    pbar.set_postfix_str(f"✓ {processed} | ⊘ {skipped} | ✗ {failed}")
 
-    print(f"\nDone: {success} days processed, {failed} failed.")
+    print(f"\n{'='*55}")
+    print(f"Batch {YEAR_START}–{YEAR_END} | ✓ {processed} | ⊘ {skipped} | ✗ {failed}")
+    print(f"{'='*55}")
 
 
 if __name__ == "__main__":

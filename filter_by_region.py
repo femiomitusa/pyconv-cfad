@@ -2,14 +2,25 @@
 
 from __future__ import annotations
 
+import argparse
 import calendar
 import json
 import math
 import multiprocessing as mp
+import shutil
 import sys
+import warnings
 from collections.abc import Iterable
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+
+# macOS writes ._<name> resource-fork files into Zarr stores; Zarr v3 warns about them harmlessly.
+warnings.filterwarnings(
+    'ignore',
+    message=r'Object at \._.*is not recognized as a component of a Zarr hierarchy',
+    category=UserWarning,
+    module='zarr',
+)
 
 import numpy as np
 import xarray as xr
@@ -187,11 +198,11 @@ def classify_cell_details(row_data: dict, urban_polygon, half_angle: float = HAL
     }
 
 
-def _require_tracking_vars(ds, nc_path: Path) -> None:
+def _require_tracking_vars(ds, tracking_path: Path) -> None:
     required = ('centroid_lat', 'centroid_lon')
     missing = [name for name in required if name not in ds]
     if missing:
-        raise ValueError(f"{nc_path.name} missing required variable(s): {', '.join(missing)}")
+        raise ValueError(f"{tracking_path.name} missing required variable(s): {', '.join(missing)}")
 
 
 def classify_dataset(ds, urban_polygon) -> dict:
@@ -311,27 +322,27 @@ def annotate_dataset(ds, classification: dict):
     return annotated
 
 
-def _output_path(nc_path: Path, output_base: str, group: str) -> Path:
-    year = nc_path.parent.parent.name
-    day_dir = nc_path.parent.name
-    stem = nc_path.stem.replace('_tracking', '')
-    return Path(output_base) / 'Arrays_Regional' / group / year / day_dir / f'{stem}_regional.nc'
+def _output_path(tracking_path: Path, output_base: str, group: str) -> Path:
+    year = tracking_path.parent.parent.name
+    day_dir = tracking_path.parent.name
+    stem = tracking_path.stem.replace('_tracking', '')
+    return Path(output_base) / 'Arrays_Regional' / group / year / day_dir / f'{stem}_regional.zarr'
 
 
-def _regional_outputs_exist(nc_path: Path, output_base: str) -> bool:
-    """True if every Stage 3 output group already exists for this tracking.nc."""
-    return all(_output_path(nc_path, output_base, group).exists() for group in OUTPUT_GROUPS)
+def _regional_outputs_exist(tracking_path: Path, output_base: str) -> bool:
+    """True if every Stage 3 output group already exists for this tracking Zarr store."""
+    return all(_output_path(tracking_path, output_base, group).exists() for group in OUTPUT_GROUPS)
 
 
-def _existing_output_counts(nc_path: Path, output_base: str) -> dict[str, int]:
-    """Read counts from existing Stage 3 files when processing is skipped."""
+def _existing_output_counts(tracking_path: Path, output_base: str) -> dict[str, int]:
+    """Read counts from existing Stage 3 Zarr stores when processing is skipped."""
     counts: dict[str, int] = {r: 0 for r in REGIONS}
     counts['unclassified'] = 0
 
     for group in (*REGIONS, 'unclassified'):
-        out_path = _output_path(nc_path, output_base, group)
+        out_path = _output_path(tracking_path, output_base, group)
         try:
-            with xr.open_dataset(out_path) as ds:
+            with xr.open_zarr(out_path, consolidated=False) as ds:
                 counts[group] = int(ds.attrs.get('region_obs_count', ds.sizes.get('obs', 0)))
         except Exception:
             counts[group] = 0
@@ -341,10 +352,30 @@ def _existing_output_counts(nc_path: Path, output_base: str) -> dict[str, int]:
 
 def _write_dataset(ds, out_path: Path) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    ds.to_netcdf(out_path)
+    if out_path.exists():
+        shutil.rmtree(out_path)
+    ds.to_zarr(out_path, mode='w', consolidated=False)
 
 
-def _write_region_view(annotated, region_codes: np.ndarray, nc_path: Path, output_base: str, group: str) -> int:
+def _subset_region_dataset(annotated: xr.Dataset, obs_idx: np.ndarray) -> xr.Dataset:
+    """Return a region subset and keep ragged samples consistent with selected obs."""
+    region_ds = annotated.isel(obs=obs_idx)
+    if 'sample_obs' not in annotated or 'sample' not in annotated.sizes:
+        return region_ds
+
+    sample_obs = annotated['sample_obs'].values.astype(np.int64)
+    keep_sample = np.isin(sample_obs, obs_idx)
+    sample_idx = np.where(keep_sample)[0]
+    region_ds = region_ds.isel(sample=sample_idx)
+
+    # Remap original obs indices to the compact obs dimension in this regional view.
+    remap = {int(old): int(new) for new, old in enumerate(obs_idx)}
+    remapped = np.array([remap[int(v)] for v in sample_obs[sample_idx]], dtype=np.int32)
+    region_ds['sample_obs'] = ('sample', remapped)
+    return region_ds
+
+
+def _write_region_view(annotated, region_codes: np.ndarray, tracking_path: Path, output_base: str, group: str) -> int:
     if group == 'unclassified':
         idx = np.where(region_codes == REGION_TO_CODE['unclassified'])[0]
     else:
@@ -354,44 +385,44 @@ def _write_region_view(annotated, region_codes: np.ndarray, nc_path: Path, outpu
         region_ds = xr.Dataset(attrs={
             'region': group,
             'region_obs_count': 0,
-            'source_file': nc_path.name,
+            'source_file': tracking_path.name,
             'empty_region_file': 'true',
         })
     else:
-        region_ds = annotated.isel(obs=idx)
+        region_ds = _subset_region_dataset(annotated, idx)
         region_ds.attrs.update({
             'region': group,
             'region_obs_count': int(len(idx)),
         })
-    _write_dataset(region_ds, _output_path(nc_path, output_base, group))
+    _write_dataset(region_ds, _output_path(tracking_path, output_base, group))
     return int(len(idx))
 
 
-def process_tracking_nc(
-    nc_path: Path,
+def process_tracking_zarr(
+    tracking_path: Path,
     urban_polygon,
     output_base: str,
     force: bool = False,
 ) -> dict[str, int]:
-    """Classify one Stage 2 tracking.nc file and write annotated + regional outputs."""
+    """Classify one Stage 2 tracking Zarr store and write annotated + regional Zarr outputs."""
     counts: dict[str, int] = {r: 0 for r in REGIONS}
     counts['unclassified'] = 0
 
-    if not force and SKIP_EXISTING_FILTERING and _regional_outputs_exist(nc_path, output_base):
-        return _existing_output_counts(nc_path, output_base)
+    if not force and SKIP_EXISTING_FILTERING and _regional_outputs_exist(tracking_path, output_base):
+        return _existing_output_counts(tracking_path, output_base)
 
     try:
-        with xr.open_dataset(nc_path) as ds:
-            _require_tracking_vars(ds, nc_path)
+        with xr.open_zarr(tracking_path, consolidated=False) as ds:
+            _require_tracking_vars(ds, tracking_path)
             classification = classify_dataset(ds, urban_polygon)
             annotated = annotate_dataset(ds.load(), classification)
     except Exception as exc:
-        print(f"  Cannot process {nc_path.name}: {exc}")
+        print(f"  Cannot process {tracking_path.name}: {exc}")
         return counts
 
     region_codes = classification['region_codes']
 
-    all_path = _output_path(nc_path, output_base, 'all')
+    all_path = _output_path(tracking_path, output_base, 'all')
     annotated.attrs.update({
         'region': 'all',
         'region_obs_count': int(annotated.sizes.get('obs', 0)),
@@ -399,17 +430,17 @@ def process_tracking_nc(
     _write_dataset(annotated, all_path)
 
     for region in REGIONS:
-        counts[region] = _write_region_view(annotated, region_codes, nc_path, output_base, region)
+        counts[region] = _write_region_view(annotated, region_codes, tracking_path, output_base, region)
     counts['unclassified'] = _write_region_view(
-        annotated, region_codes, nc_path, output_base, 'unclassified'
+        annotated, region_codes, tracking_path, output_base, 'unclassified'
     )
 
     return counts
 
 
-def _process_nc_wrapper(args: tuple) -> dict[str, int]:
-    nc_path, urban_polygon, output_base, force = args
-    return process_tracking_nc(nc_path, urban_polygon, output_base, force)
+def _process_zarr_wrapper(args: tuple) -> dict[str, int]:
+    tracking_path, urban_polygon, output_base, force = args
+    return process_tracking_zarr(tracking_path, urban_polygon, output_base, force)
 
 
 def filter_day_directory(
@@ -420,18 +451,18 @@ def filter_day_directory(
     max_workers: int | None = None,
     force: bool = False,
 ) -> dict[str, int]:
-    """Process all *_tracking.nc files in one day directory."""
-    nc_files = sorted(day_dir.glob('*_tracking.nc'))
+    """Process all *_tracking.zarr stores in one day directory."""
+    tracking_stores = sorted(day_dir.glob('*_tracking.zarr'))
     total: dict[str, int] = {r: 0 for r in REGIONS}
     total['unclassified'] = 0
-    if not nc_files:
+    if not tracking_stores:
         return total
 
-    if use_parallel and len(nc_files) > 1:
-        n_workers = max_workers or min(mp.cpu_count(), len(nc_files))
-        file_args = [(f, urban_polygon, output_base, force) for f in nc_files]
+    if use_parallel and len(tracking_stores) > 1:
+        n_workers = max_workers or min(mp.cpu_count(), len(tracking_stores))
+        file_args = [(f, urban_polygon, output_base, force) for f in tracking_stores]
         with ProcessPoolExecutor(max_workers=n_workers) as ex:
-            futures = {ex.submit(_process_nc_wrapper, a): a[0] for a in file_args}
+            futures = {ex.submit(_process_zarr_wrapper, a): a[0] for a in file_args}
             for fut in as_completed(futures):
                 try:
                     for r, c in fut.result().items():
@@ -439,8 +470,8 @@ def filter_day_directory(
                 except Exception as exc:
                     print(f"  Error: {futures[fut].name}: {exc}")
     else:
-        for nc in nc_files:
-            for r, c in process_tracking_nc(nc, urban_polygon, output_base, force).items():
+        for tracking_store in tracking_stores:
+            for r, c in process_tracking_zarr(tracking_store, urban_polygon, output_base, force).items():
                 total[r] += c
 
     return total
@@ -529,13 +560,22 @@ def _date_filter_from_config() -> str | None:
     return f'{TARGET_YEAR}-{TARGET_MONTH:02d}-{TARGET_DAY:02d}'
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description='Classify Stage 2 tracking Zarr stores by region.')
+    parser.add_argument('--date', help='Optional date filter: YYYY, YYYY-MM, or YYYY-MM-DD')
+    parser.add_argument('--force', action='store_true', help='Overwrite existing regional Zarr outputs')
+    parser.add_argument('--serial', action='store_true', help='Disable file-level parallelism')
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = _parse_args()
     source = ARRAY_OUTPUT_DIR
     target = BASE_DATA_DIR
-    date_filter = _date_filter_from_config()
-    use_parallel = REGIONAL_USE_PARALLEL
+    date_filter = args.date or _date_filter_from_config()
+    use_parallel = REGIONAL_USE_PARALLEL and not args.serial
     workers = REGIONAL_MAX_WORKERS
-    force = False
+    force = args.force
 
     print(f"Source  : {source}")
     print(f"Target  : {target}")
