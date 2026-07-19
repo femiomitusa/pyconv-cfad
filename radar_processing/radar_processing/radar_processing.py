@@ -16,6 +16,20 @@ from config import (
 FIELD_NAMES = ['reflectivity', 'differential_reflectivity', 'cross_correlation_ratio', 'kdp']
 
 
+def has_usable_reflectivity(filename: str, threshold_dbz: float = 25.0) -> bool:
+    """Quick pre-check: max reflectivity >= threshold? Avoids gridding useless files."""
+    try:
+        radar = pyart.io.read(filename)
+        Z = radar.fields.get('reflectivity')
+        if Z is None:
+            return False
+        Z_data = np.ma.filled(Z['data'].astype(float), np.nan)
+        max_val = np.nanmax(Z_data)
+        return bool(np.isfinite(max_val) and max_val >= threshold_dbz)
+    except Exception:
+        return True
+
+
 def setup_radar_grid(grid_bounds, grid_points, grid_spacing):
     xx, yy = np.meshgrid(
         np.linspace(grid_bounds[0], grid_bounds[1], grid_points),
@@ -55,9 +69,17 @@ def process_radar_file(
     )
     del radar
 
+    # Validate that grid has valid data before accessing
+    lat_data = grid.point_latitude['data']
+    lon_data = grid.point_longitude['data']
+    
+    if lat_data.size == 0 or lon_data.size == 0 or lat_data.shape[0] == 0:
+        # Grid is empty/invalid — skip this file (likely incomplete/corrupted)
+        raise ValueError("Empty grid")
+
     fields = {name: grid.fields[name]['data'] for name in field_names}
-    lat_2d = grid.point_latitude['data'][0].astype(np.float32)
-    lon_2d = grid.point_longitude['data'][0].astype(np.float32)
+    lat_2d = lat_data[0].astype(np.float32)
+    lon_2d = lon_data[0].astype(np.float32)
     del grid
 
     # keep raw copy for visualization before RhoHV masking

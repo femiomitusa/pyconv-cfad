@@ -467,10 +467,10 @@ def plot_cfads(target_indices, aggregated_data, plot_output, heights, ymax, zlim
 def plot_profiles(target_indices, aggregated_data, profile_output, heights, ymax, include_iqr_on_mean, region=None):
     # Configuration
     plot_config = {
-        'Z': ('Z (dBZ)', 'Reflectivity (Z)'),
-        'ZDR': ('$Z_{DR}$ (dB)', r'Differential Reflectivity ($Z_{DR}$)'),
-        'rho': (r'$\rho_{HV}$', r'Correlation Coefficient ($\rho_{HV}$)'),
-        'kdp': ('K$_{DP}$ (deg/km)', r'Specific Differential Phase ($K_{DP}$)')
+        'Z': ('Z (dBZ)', 'Reflectivity (Z)', (-10, 60)),
+        'ZDR': ('$Z_{DR}$ (dB)', r'Differential Reflectivity ($Z_{DR}$)', None),
+        'rho': (r'$\rho_{HV}$', r'Correlation Coefficient ($\rho_{HV}$)', None),
+        'kdp': ('K$_{DP}$ (deg/km)', r'Specific Differential Phase ($K_{DP}$)', None)
     }
     
     stat_types = [
@@ -483,7 +483,7 @@ def plot_profiles(target_indices, aggregated_data, profile_output, heights, ymax
         fig, axes = plt.subplots(2, 2, figsize=(15, 10), dpi=150)
         axes = axes.flatten()
         
-        for idx_var, (var, (xlabel, title)) in enumerate(plot_config.items()):
+        for idx_var, (var, (xlabel, title, xlim)) in enumerate(plot_config.items()):
             ax = axes[idx_var]
             color = profile_colors[var]
             
@@ -503,6 +503,8 @@ def plot_profiles(target_indices, aggregated_data, profile_output, heights, ymax
             # Customize subplot
             ax.set(title=f'({chr(97 + idx_var)}) {title}', 
                    xlabel=xlabel, ylabel='Altitude (km)', ylim=(0, ymax))
+            if xlim is not None:
+                ax.set_xlim(xlim)
             ax.grid(True, linestyle='--', alpha=0.7)
             ax.title.set_fontsize(14)
             
@@ -521,10 +523,10 @@ def plot_profiles(target_indices, aggregated_data, profile_output, heights, ymax
 def plot_percentiles(target_indices, aggregated_data, profile_output, heights, ymax, region=None):
     """Create 2x2 percentile family plots showing multiple percentiles per variable"""
     plot_config = {
-        'Z': ('Z (dBZ)', 'Reflectivity (Z)'),
-        'ZDR': ('$Z_{DR}$ (dB)', r'Differential Reflectivity ($Z_{DR})'),
-        'rho': (r'$\rho_{HV}$', r'Correlation Coefficient ($\rho_{HV}$)'),
-        'kdp': ('K$_{DP}$ (deg/km)', r'Specific Differential Phase ($K_{DP}$)')
+        'Z': ('Z (dBZ)', 'Reflectivity (Z)', (-10, 60)),
+        'ZDR': ('$Z_{DR}$ (dB)', r'Differential Reflectivity ($Z_{DR})', None),
+        'rho': (r'$\rho_{HV}$', r'Correlation Coefficient ($\rho_{HV}$)', None),
+        'kdp': ('K$_{DP}$ (deg/km)', r'Specific Differential Phase ($K_{DP}$)', None)
     }
     
     
@@ -534,7 +536,7 @@ def plot_percentiles(target_indices, aggregated_data, profile_output, heights, y
     fig, axes = plt.subplots(2, 2, figsize=(15, 10), dpi=150)
     axes = axes.flatten()
     
-    for idx_var, (var, (xlabel, title)) in enumerate(plot_config.items()):
+    for idx_var, (var, (xlabel, title, xlim)) in enumerate(plot_config.items()):
         ax = axes[idx_var]
         color = profile_colors[var]
         
@@ -565,6 +567,8 @@ def plot_percentiles(target_indices, aggregated_data, profile_output, heights, y
         # Customize subplot
         ax.set(title=f'({chr(97 + idx_var)}) {title}',
                xlabel=xlabel, ylabel='Altitude (km)', ylim=(0, ymax))
+        if xlim is not None:
+            ax.set_xlim(xlim)
         ax.grid(True, linestyle='--', alpha=0.3)
         ax.title.set_fontsize(14)
         ax.legend(fontsize=10, loc='best')
